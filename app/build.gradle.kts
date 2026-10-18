@@ -17,8 +17,8 @@ android {
     applicationId = "com.aistudio.smarthomecloud.kxzqpm"
     minSdk = 24
     targetSdk = 36
-    versionCode = 1
-    versionName = "1.0"
+    versionCode = 2
+    versionName = "2.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -87,16 +87,24 @@ val moduleBuildDir = layout.buildDirectory
 val syncDebugApkToRootFolder by tasks.registering {
   val targetDebugDir = rootDebugDir
   val fallbackApk = fallbackBuiltApk
-  val primaryApkProvider = moduleBuildDir.file("outputs/apk/debug/app-debug.apk")
+  val buildDirProvider = moduleBuildDir
   outputs.upToDateWhen { false }
   doLast {
     if (!targetDebugDir.exists()) {
       targetDebugDir.mkdirs()
     }
-    val primaryApk = primaryApkProvider.get().asFile
-    val sourceApk = listOf(primaryApk, fallbackApk)
-      .filter { it.exists() && it.length() > 0L }
-      .maxByOrNull { it.lastModified() }
+    val buildDirFile = buildDirProvider.get().asFile
+    val builtApksInBuildDir = if (buildDirFile.exists()) {
+      buildDirFile.walkTopDown()
+        .filter { it.isFile && it.extension == "apk" && !it.name.contains("androidTest", ignoreCase = true) }
+        .toList()
+    } else {
+      emptyList()
+    }
+
+    // Always prefer the freshly packaged APK from buildDir over the previous cached .build-outputs APK
+    val sourceApk = builtApksInBuildDir.maxByOrNull { it.lastModified() }
+      ?: fallbackApk.takeIf { it.exists() && it.length() > 0L }
 
     if (sourceApk != null) {
       val debugApkDest = File(targetDebugDir, "debug.apk")
@@ -104,9 +112,12 @@ val syncDebugApkToRootFolder by tasks.registering {
       sourceApk.copyTo(debugApkDest, overwrite = true)
       sourceApk.copyTo(namedApkDest, overwrite = true)
       File(targetDebugDir, "BUILD_INFO.txt").writeText(
-        "Application: Smart Home Cloud (Single APK)\n" +
+        "Application: Smart Home Cloud v2.0 (Single APK)\n" +
+          "Version: 2.0 (versionCode = 2)\n" +
           "Updated At (Epoch ms): ${System.currentTimeMillis()}\n" +
-          "Source APK: ${sourceApk.absolutePath} (${sourceApk.length()} bytes)\n" +
+          "BuildDir Path: ${buildDirFile.absolutePath}\n" +
+          "Found APKs in BuildDir: ${builtApksInBuildDir.joinToString { "${it.absolutePath} (${it.length()}B)" }}\n" +
+          "Selected Source APK: ${sourceApk.absolutePath} (${sourceApk.length()} bytes)\n" +
           "Included Updates:\n" +
           "- Email/Password Login, Account Creation & Password Reset + Google Sign-In\n" +
           "- Global WebRTC P2P Architecture (RTCDataChannel + 30 FPS Live Stream via users/{uid}/signaling)\n" +

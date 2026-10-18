@@ -752,8 +752,8 @@ fun ModeSelectorScreen(
                     title = {
                         Column {
                             Text(
-                                text = "Smart Home Cloud",
-                                style = MaterialTheme.typography.titleLarge,
+                                text = "Smart Home Cloud v2.0 (Global P2P)",
+                                style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
