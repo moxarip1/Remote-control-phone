@@ -137,6 +137,8 @@ class HomeServerForegroundService : Service() {
     private var legacyFirestoreSignalingRegistration: ListenerRegistration? = null
 
     private val addedRemoteCandidateKeys = mutableSetOf<String>()
+    private val pendingAdminCandidates = mutableListOf<IceCandidate>()
+    private var isRemoteOfferSet: Boolean = false
     private val localServerCandidatesArray = JSONArray()
     private var lastHandledOfferKey: String? = null
     private var currentP2pSessionId: String = ""
@@ -535,23 +537,17 @@ class HomeServerForegroundService : Service() {
 
             setupLocalVideoSourceOnly()
 
-            // Clear stale signaling state so old cached offers don't re-trigger on startup
+            // Attach listeners first and announce server readiness without wiping an in-flight Admin Offer
+            listenForAdminWebRtcSignaling(uid)
+
             publishServerSignalingFields(
                 uid = uid,
                 fields = mapOf(
                     "userId" to uid,
                     "serverStatus" to "ONLINE_WAITING_FOR_OFFER",
-                    "offerSdp" to "",
-                    "offerType" to "",
-                    "answerSdp" to "",
-                    "answerType" to "",
-                    "serverCandidatesJson" to "[]",
-                    "adminCandidatesJson" to "[]",
                     "updatedAt" to System.currentTimeMillis()
                 )
             )
-
-            listenForAdminWebRtcSignaling(uid)
         } catch (t: Throwable) {
             appendLog(
                 ServerLog(
@@ -681,7 +677,7 @@ class HomeServerForegroundService : Service() {
 
     /**
      * Listens to `users/{uid}/signaling` in Firebase Firestore and Realtime Database
-     * with strict session/offer deduplication so multiple listeners never collide.
+     * with strict session/offer deduplication and candidate queuing.
      */
     private fun listenForAdminWebRtcSignaling(uid: String) {
         val firestore = try {
@@ -693,6 +689,8 @@ class HomeServerForegroundService : Service() {
         }
         val signalingDoc = firestore?.collection("users")?.document(uid)
             ?.collection("signaling")?.document("main")
+        val legacySignalingDoc = firestore?.collection("users")?.document(uid)
+            ?.collection("webrtc_signaling")?.document("main")
 
         fun onSignalingPayload(
             sessionId: String,
@@ -705,7 +703,7 @@ class HomeServerForegroundService : Service() {
             // Handle fresh SDP Offer from Admin Controller
             if (offerSdp.isNotBlank() && offerType.equals("offer", ignoreCase = true)) {
                 val offerKey = "${sessionId.ifBlank { "default" }}:${offerSdp.hashCode()}"
-                val shouldHandle = synchronized(webRtcLock) {
+                val isNewOffer = synchronized(webRtcLock) {
                     if (offerKey != lastHandledOfferKey) {
                         lastHandledOfferKey = offerKey
                         currentP2pSessionId = sessionId
@@ -714,10 +712,16 @@ class HomeServerForegroundService : Service() {
                         false
                     }
                 }
-                if (shouldHandle) {
+                if (isNewOffer) {
                     serviceScope.launch {
-                        handleIncomingWebRtcOffer(uid, sessionId, offerSdp)
+                        handleIncomingWebRtcOffer(
+                            uid = uid,
+                            sessionId = sessionId,
+                            offerSdp = offerSdp,
+                            initialAdminCandidatesJson = adminCandidatesJson
+                        )
                     }
+                    return
                 }
             }
 
@@ -731,6 +735,20 @@ class HomeServerForegroundService : Service() {
         try {
             firestoreSignalingRegistration?.remove()
             firestoreSignalingRegistration = signalingDoc?.addSnapshotListener { snapshot, error ->
+                if (error != null || snapshot == null || !snapshot.exists()) return@addSnapshotListener
+                onSignalingPayload(
+                    sessionId = snapshot.getString("sessionId").orEmpty(),
+                    offerSdp = snapshot.getString("offerSdp").orEmpty(),
+                    offerType = snapshot.getString("offerType").orEmpty(),
+                    adminCandidatesJson = snapshot.getString("adminCandidatesJson").orEmpty()
+                )
+            }
+        } catch (_: Throwable) {
+        }
+
+        try {
+            legacyFirestoreSignalingRegistration?.remove()
+            legacyFirestoreSignalingRegistration = legacySignalingDoc?.addSnapshotListener { snapshot, error ->
                 if (error != null || snapshot == null || !snapshot.exists()) return@addSnapshotListener
                 onSignalingPayload(
                     sessionId = snapshot.getString("sessionId").orEmpty(),
@@ -771,6 +789,7 @@ class HomeServerForegroundService : Service() {
             val factory = peerConnectionFactory ?: return null
 
             isPeerSessionActive = false
+            isRemoteOfferSet = false
 
             try {
                 activeDataChannel?.unregisterObserver()
@@ -789,21 +808,28 @@ class HomeServerForegroundService : Service() {
             peerConnection = null
 
             addedRemoteCandidateKeys.clear()
+            pendingAdminCandidates.clear()
             synchronized(localServerCandidatesArray) {
                 while (localServerCandidatesArray.length() > 0) {
                     localServerCandidatesArray.remove(0)
                 }
             }
 
+            // Configure Google STUN Servers in PeerConnection.RTCConfiguration for NAT traversal
             val iceServers = listOf(
                 PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
                 PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer(),
                 PeerConnection.IceServer.builder("stun:stun2.l.google.com:19302").createIceServer(),
-                PeerConnection.IceServer.builder("stun:stun3.l.google.com:19302").createIceServer()
+                PeerConnection.IceServer.builder("stun:stun3.l.google.com:19302").createIceServer(),
+                PeerConnection.IceServer.builder("stun:stun4.l.google.com:19302").createIceServer()
             )
             val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
                 sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
                 continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+                iceTransportsType = PeerConnection.IceTransportsType.ALL
+                bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
+                rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
+                tcpCandidatePolicy = PeerConnection.TcpCandidatePolicy.ENABLED
             }
 
             val pc = try {
@@ -821,7 +847,7 @@ class HomeServerForegroundService : Service() {
                                 }
                                 PeerConnection.IceConnectionState.CHECKING -> {
                                     isPeerSessionActive = true
-                                    "جاري التفاوض السحابي (ICE CHECKING)..."
+                                    "جاري عبور NAT عبر Google STUN (ICE CHECKING)..."
                                 }
                                 PeerConnection.IceConnectionState.DISCONNECTED -> {
                                     isPeerSessionActive = false
@@ -848,7 +874,23 @@ class HomeServerForegroundService : Service() {
                         }
 
                         override fun onIceConnectionReceivingChange(receiving: Boolean) {}
-                        override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState?) {}
+
+                        override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState?) {
+                            if (newState == PeerConnection.IceGatheringState.COMPLETE) {
+                                val serialized = synchronized(localServerCandidatesArray) {
+                                    localServerCandidatesArray.toString()
+                                }
+                                val fields = mutableMapOf<String, Any>(
+                                    "userId" to uid,
+                                    "serverCandidatesJson" to serialized,
+                                    "updatedAt" to System.currentTimeMillis()
+                                )
+                                if (sessionId.isNotBlank()) {
+                                    fields["sessionId"] = sessionId
+                                }
+                                publishServerSignalingFields(uid = uid, fields = fields)
+                            }
+                        }
 
                         override fun onIceCandidate(candidate: IceCandidate?) {
                             if (candidate == null) return
@@ -857,10 +899,9 @@ class HomeServerForegroundService : Service() {
                                 put("sdpMLineIndex", candidate.sdpMLineIndex)
                                 put("sdp", candidate.sdp)
                             }
-                            val serialized: String
-                            synchronized(localServerCandidatesArray) {
+                            val serialized = synchronized(localServerCandidatesArray) {
                                 localServerCandidatesArray.put(candidateObj)
-                                serialized = localServerCandidatesArray.toString()
+                                localServerCandidatesArray.toString()
                             }
                             val fields = mutableMapOf<String, Any>(
                                 "userId" to uid,
@@ -914,22 +955,45 @@ class HomeServerForegroundService : Service() {
         }
     }
 
-    private fun handleIncomingWebRtcOffer(uid: String, sessionId: String, offerSdp: String) {
+    private fun handleIncomingWebRtcOffer(
+        uid: String,
+        sessionId: String,
+        offerSdp: String,
+        initialAdminCandidatesJson: String = ""
+    ) {
         appendLog(
             ServerLog(
                 method = "WEBRTC-P2P",
                 endpoint = "users/$uid/signaling",
-                message = "تم استلام SDP Offer من الآدمن — جاري فتح نفق P2P وإرسال SDP Answer..."
+                message = "تم استلام SDP Offer من الآدمن — جاري تهيئة Google STUN وإرسال SDP Answer..."
             )
         )
 
         val pc = buildPeerConnection(uid, sessionId) ?: return
+
+        // Pre-queue any Admin ICE candidates that arrived together with the Offer
+        if (initialAdminCandidatesJson.isNotBlank() && initialAdminCandidatesJson != "[]") {
+            processIncomingAdminCandidates(initialAdminCandidatesJson)
+        }
 
         try {
             val remoteOffer = SessionDescription(SessionDescription.Type.OFFER, offerSdp)
             pc.setRemoteDescription(
                 object : SimpleSdpObserver() {
                     override fun onSetSuccess() {
+                        // Now that remote description is set, flush all queued Admin ICE candidates!
+                        synchronized(webRtcLock) {
+                            isRemoteOfferSet = true
+                            val queued = pendingAdminCandidates.toList()
+                            pendingAdminCandidates.clear()
+                            for (candidate in queued) {
+                                try {
+                                    pc.addIceCandidate(candidate)
+                                } catch (_: Throwable) {
+                                }
+                            }
+                        }
+
                         try {
                             val constraints = MediaConstraints().apply {
                                 mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
@@ -944,10 +1008,14 @@ class HomeServerForegroundService : Service() {
                                                 object : SimpleSdpObserver() {
                                                     override fun onSetSuccess() {
                                                         isPeerSessionActive = true
+                                                        val currentServerCandidates = synchronized(localServerCandidatesArray) {
+                                                            localServerCandidatesArray.toString()
+                                                        }
                                                         val fields = mutableMapOf<String, Any>(
                                                             "userId" to uid,
                                                             "answerSdp" to desc.description,
                                                             "answerType" to "answer",
+                                                            "serverCandidatesJson" to currentServerCandidates,
                                                             "updatedAt" to System.currentTimeMillis()
                                                         )
                                                         if (sessionId.isNotBlank()) {
@@ -958,7 +1026,7 @@ class HomeServerForegroundService : Service() {
                                                             ServerLog(
                                                                 method = "WEBRTC-P2P",
                                                                 endpoint = "users/$uid/signaling",
-                                                                message = "تم إرسال SDP Answer عبر السحابة بنجاح"
+                                                                message = "تم إرسال SDP Answer ومرشحات STUN عبر السحابة بنجاح"
                                                             )
                                                         )
                                                     }
@@ -988,6 +1056,17 @@ class HomeServerForegroundService : Service() {
     private fun registerServerDataChannel(channel: DataChannel) {
         activeDataChannel = channel
         try {
+            if (channel.state() == DataChannel.State.OPEN) {
+                isPeerSessionActive = true
+                _webRtcStateText.value = "متصل عالمياً عبر P2P (RTCDataChannel نشط)"
+                serviceScope.launch {
+                    syncNodeStateWithCloud(isOnline = _isRunning.value)
+                }
+            }
+        } catch (_: Throwable) {
+        }
+
+        try {
             channel.registerObserver(
                 object : DataChannel.Observer {
                     override fun onBufferedAmountChange(previousAmount: Long) {}
@@ -1008,8 +1087,14 @@ class HomeServerForegroundService : Service() {
                                     message = "تم فتح قناة البيانات المباشرة RTCDataChannel بنجاح مع هاتف الآدمن"
                                 )
                             )
+                            serviceScope.launch {
+                                syncNodeStateWithCloud(isOnline = _isRunning.value)
+                            }
                         } else if (state == DataChannel.State.CLOSED) {
                             _webRtcStateText.value = "بانتظار اتصال P2P جديد"
+                            serviceScope.launch {
+                                syncNodeStateWithCloud(isOnline = _isRunning.value)
+                            }
                         }
                     }
 
@@ -1391,7 +1476,6 @@ class HomeServerForegroundService : Service() {
 
     private fun processIncomingAdminCandidates(candidatesJson: String) {
         synchronized(webRtcLock) {
-            val pc = peerConnection ?: return
             try {
                 val array = JSONArray(candidatesJson)
                 for (i in 0 until array.length()) {
@@ -1401,7 +1485,17 @@ class HomeServerForegroundService : Service() {
                     val sdpMLineIndex = obj.optInt("sdpMLineIndex", 0)
                     val key = "$sdpMid:$sdpMLineIndex:$sdp"
                     if (sdp.isNotBlank() && addedRemoteCandidateKeys.add(key)) {
-                        pc.addIceCandidate(IceCandidate(sdpMid, sdpMLineIndex, sdp))
+                        val candidate = IceCandidate(sdpMid, sdpMLineIndex, sdp)
+                        val pc = peerConnection
+                        if (isRemoteOfferSet && pc != null) {
+                            try {
+                                pc.addIceCandidate(candidate)
+                            } catch (_: Throwable) {
+                            }
+                        } else {
+                            // Queue until setRemoteDescription(OFFER) completes onSetSuccess()
+                            pendingAdminCandidates.add(candidate)
+                        }
                     }
                 }
             } catch (_: Throwable) {

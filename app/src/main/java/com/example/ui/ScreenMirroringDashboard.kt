@@ -2,7 +2,9 @@ package com.example.ui
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.view.LayoutInflater
 import androidx.activity.compose.BackHandler
+import com.example.R
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -553,7 +555,15 @@ fun ScreenMirroringDashboard(
                         ) {
                             AndroidView(
                                 factory = { ctx ->
-                                    SurfaceViewRenderer(ctx).apply {
+                                    val renderer = try {
+                                        LayoutInflater.from(ctx)
+                                            .inflate(R.layout.webrtc_surface_view_renderer, null, false) as SurfaceViewRenderer
+                                    } catch (_: Throwable) {
+                                        SurfaceViewRenderer(ctx).apply {
+                                            id = R.id.webrtc_surface_view_renderer
+                                        }
+                                    }
+                                    renderer.apply {
                                         try {
                                             init(p2pManager.eglBase?.eglBaseContext, null)
                                             setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)

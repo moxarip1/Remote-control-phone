@@ -23,10 +23,14 @@ import com.google.firebase.firestore.SetOptions
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
@@ -58,7 +62,7 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * Global WebRTC P2P Admin Client Manager (`WebRtcP2pClientManager`):
  * Connects to the Home Node from ANY network worldwide (different Wi-Fi, 4G/5G cellular, etc.)
- * using Firebase Signaling (`users/{uid}/signaling`) and executes all commands
+ * using Firebase Signaling (`users/{uid}/signaling`) and Google STUN servers, and executes all commands
  * (`/status`, `/files`, `/download`, `/upload`, `/delete`, `/screenshot`) + 30 FPS Video Stream
  * over a unified encrypted `PeerConnection` + `RTCDataChannel`.
  */
@@ -67,15 +71,15 @@ class WebRtcP2pClientManager(
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    // Lazily accessed shared EglBase so instantiating WebRtcP2pClientManager on startup never crashes
-    // or allocates duplicate OpenGL contexts on the Home Node Server phone.
     val eglBase: EglBase?
         get() = getSharedEglBase()
 
     private var peerConnection: PeerConnection? = null
     private var commandDataChannel: DataChannel? = null
+    private var negotiationWatchdogJob: Job? = null
 
     private var firestoreSignalingRegistration: ListenerRegistration? = null
+    private var legacyFirestoreSignalingRegistration: ListenerRegistration? = null
     private var rtdbSignalingRef: DatabaseReference? = null
     private var rtdbSignalingListener: ValueEventListener? = null
 
@@ -94,6 +98,7 @@ class WebRtcP2pClientManager(
     private var activeSessionId: String = ""
     private var connectedUserId: String = ""
     private var activeSecretToken: String = ""
+    private var lastAttemptTimestampMs: Long = 0L
 
     // Pending Request-Response Coroutine Deferreds keyed by reqId
     private val pendingJsonResponses = ConcurrentHashMap<String, CompletableDeferred<JSONObject>>()
@@ -113,7 +118,7 @@ class WebRtcP2pClientManager(
 
     /**
      * Initiates or refreshes the global WebRTC PeerConnection & RTCDataChannel with the Home Node
-     * using Firebase Signaling at `users/{uid}/signaling`.
+     * using Firebase Signaling at `users/{uid}/signaling` and Google public STUN servers.
      */
     @Synchronized
     fun connectToHomeNodeP2p(
@@ -125,10 +130,27 @@ class WebRtcP2pClientManager(
         if (secretToken.isNotBlank()) {
             activeSecretToken = secretToken
         }
-        if (!forceReconnect && _isP2pConnected.value && connectedUserId == userId && commandDataChannel?.state() == DataChannel.State.OPEN) {
+
+        val currentDcState = try {
+            commandDataChannel?.state()
+        } catch (_: Throwable) {
+            null
+        }
+        if (!forceReconnect && _isP2pConnected.value && connectedUserId == userId && currentDcState == DataChannel.State.OPEN) {
             return
         }
 
+        // Avoid restarting an in-flight negotiation that started < 4.5 seconds ago unless forced
+        val now = System.currentTimeMillis()
+        if (!forceReconnect &&
+            connectedUserId == userId &&
+            peerConnection != null &&
+            (now - lastAttemptTimestampMs) < 4_500L
+        ) {
+            return
+        }
+
+        lastAttemptTimestampMs = now
         connectedUserId = userId
         val sessionId = UUID.randomUUID().toString().take(12)
         activeSessionId = sessionId
@@ -142,20 +164,30 @@ class WebRtcP2pClientManager(
             return
         }
 
+        // 1. Configure Google STUN Servers for NAT traversal across different Wi-Fi / 4G / 5G networks
         val iceServers = listOf(
             PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
             PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer(),
             PeerConnection.IceServer.builder("stun:stun2.l.google.com:19302").createIceServer(),
-            PeerConnection.IceServer.builder("stun:stun3.l.google.com:19302").createIceServer()
+            PeerConnection.IceServer.builder("stun:stun3.l.google.com:19302").createIceServer(),
+            PeerConnection.IceServer.builder("stun:stun4.l.google.com:19302").createIceServer()
         )
         val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+            iceTransportsType = PeerConnection.IceTransportsType.ALL
+            bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
+            rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
+            tcpCandidatePolicy = PeerConnection.TcpCandidatePolicy.ENABLED
         }
 
+        val signalingLock = Any()
         val adminCandidatesArray = JSONArray()
         val addedServerCandidates = mutableSetOf<String>()
-        var isRemoteAnswerApplied = false
+        val pendingServerCandidates = mutableListOf<IceCandidate>()
+        var isRemoteAnswerStarted = false
+        var isRemoteDescriptionSet = false
+        var localOfferSdpText = ""
 
         val firestore = try {
             FirebaseFirestore.getInstance(
@@ -200,7 +232,7 @@ class WebRtcP2pClientManager(
                     override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState?) {
                         when (newState) {
                             PeerConnection.IceConnectionState.CHECKING -> {
-                                _p2pConnectionStatus.value = "جاري عبور الجدران النارية (STUN/ICE Checking)..."
+                                _p2pConnectionStatus.value = "جاري عبور الجدران النارية عبر Google STUN (ICE Checking)..."
                             }
                             PeerConnection.IceConnectionState.CONNECTED,
                             PeerConnection.IceConnectionState.COMPLETED -> {
@@ -213,7 +245,7 @@ class WebRtcP2pClientManager(
                             }
                             PeerConnection.IceConnectionState.FAILED -> {
                                 _isP2pConnected.value = false
-                                _p2pConnectionStatus.value = "تعذر إكمال مسار ICE المباشر — اضغط تحديث لإعادة المحاولة"
+                                _p2pConnectionStatus.value = "تعذر إكمال مسار ICE المباشر — جاري إعادة التفاوض التلقائي..."
                             }
                             PeerConnection.IceConnectionState.CLOSED -> {
                                 _isP2pConnected.value = false
@@ -224,7 +256,25 @@ class WebRtcP2pClientManager(
                     }
 
                     override fun onIceConnectionReceivingChange(receiving: Boolean) {}
-                    override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState?) {}
+
+                    override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState?) {
+                        if (newState == PeerConnection.IceGatheringState.COMPLETE) {
+                            val serialized = synchronized(adminCandidatesArray) {
+                                adminCandidatesArray.toString()
+                            }
+                            val fields = mutableMapOf<String, Any>(
+                                "userId" to userId,
+                                "sessionId" to sessionId,
+                                "adminCandidatesJson" to serialized,
+                                "updatedAt" to System.currentTimeMillis()
+                            )
+                            if (localOfferSdpText.isNotBlank()) {
+                                fields["offerSdp"] = localOfferSdpText
+                                fields["offerType"] = "offer"
+                            }
+                            publishSignalingFields(fields)
+                        }
+                    }
 
                     override fun onIceCandidate(candidate: IceCandidate?) {
                         if (candidate == null) return
@@ -233,19 +283,21 @@ class WebRtcP2pClientManager(
                             put("sdpMLineIndex", candidate.sdpMLineIndex)
                             put("sdp", candidate.sdp)
                         }
-                        val serialized: String
-                        synchronized(adminCandidatesArray) {
+                        val serialized = synchronized(adminCandidatesArray) {
                             adminCandidatesArray.put(obj)
-                            serialized = adminCandidatesArray.toString()
+                            adminCandidatesArray.toString()
                         }
-                        publishSignalingFields(
-                            mapOf(
-                                "userId" to userId,
-                                "sessionId" to sessionId,
-                                "adminCandidatesJson" to serialized,
-                                "updatedAt" to System.currentTimeMillis()
-                            )
+                        val fields = mutableMapOf<String, Any>(
+                            "userId" to userId,
+                            "sessionId" to sessionId,
+                            "adminCandidatesJson" to serialized,
+                            "updatedAt" to System.currentTimeMillis()
                         )
+                        if (localOfferSdpText.isNotBlank()) {
+                            fields["offerSdp"] = localOfferSdpText
+                            fields["offerType"] = "offer"
+                        }
+                        publishSignalingFields(fields)
                     }
 
                     override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>?) {}
@@ -303,48 +355,105 @@ class WebRtcP2pClientManager(
         } catch (_: Throwable) {
         }
 
-        val answerLock = Any()
+        fun parseAndEnqueueOrAddServerCandidates(serverCandidatesJson: String) {
+            if (serverCandidatesJson.isBlank() || serverCandidatesJson == "[]") return
+            val activePc = peerConnection ?: return
+            synchronized(signalingLock) {
+                try {
+                    val arr = JSONArray(serverCandidatesJson)
+                    for (i in 0 until arr.length()) {
+                        val cObj = arr.getJSONObject(i)
+                        val sdp = cObj.optString("sdp")
+                        val sdpMid = cObj.optString("sdpMid")
+                        val sdpMLineIndex = cObj.optInt("sdpMLineIndex", 0)
+                        val key = "$sdpMid:$sdpMLineIndex:$sdp"
+                        if (sdp.isNotBlank() && addedServerCandidates.add(key)) {
+                            val iceCandidate = IceCandidate(sdpMid, sdpMLineIndex, sdp)
+                            if (isRemoteDescriptionSet) {
+                                try {
+                                    activePc.addIceCandidate(iceCandidate)
+                                } catch (_: Throwable) {
+                                }
+                            } else {
+                                // Queue candidate until setRemoteDescription(ANSWER) succeeds!
+                                pendingServerCandidates.add(iceCandidate)
+                            }
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+        }
 
         fun processAnswerAndServerCandidates(
             incomingSessionId: String,
+            offerSdpInDoc: String,
             answerSdp: String,
             answerType: String,
             serverCandidatesJson: String
         ) {
-            if (incomingSessionId.isNotBlank() && incomingSessionId != sessionId) return
             val activePc = peerConnection ?: return
 
-            synchronized(answerLock) {
-                if (!isRemoteAnswerApplied && answerSdp.isNotBlank() && answerType.equals("answer", ignoreCase = true)) {
-                    isRemoteAnswerApplied = true
+            // If the Home Node just started up and cleared offerSdp while we are still waiting for an answer,
+            // immediately re-publish our current SDP Offer & Admin ICE candidates so negotiation never stalls.
+            if (!isRemoteAnswerStarted &&
+                offerSdpInDoc.isBlank() &&
+                answerSdp.isBlank() &&
+                localOfferSdpText.isNotBlank()
+            ) {
+                val currentAdminCandidates = synchronized(adminCandidatesArray) {
+                    adminCandidatesArray.toString()
+                }
+                publishSignalingFields(
+                    mapOf(
+                        "userId" to userId,
+                        "sessionId" to sessionId,
+                        "offerSdp" to localOfferSdpText,
+                        "offerType" to "offer",
+                        "adminCandidatesJson" to currentAdminCandidates,
+                        "updatedAt" to System.currentTimeMillis()
+                    )
+                )
+                return
+            }
+
+            if (incomingSessionId.isNotBlank() && incomingSessionId != sessionId) return
+
+            // Enqueue or apply any server ICE candidates
+            parseAndEnqueueOrAddServerCandidates(serverCandidatesJson)
+
+            synchronized(signalingLock) {
+                if (!isRemoteAnswerStarted && answerSdp.isNotBlank() && answerType.equals("answer", ignoreCase = true)) {
+                    isRemoteAnswerStarted = true
                     try {
                         val answerDesc = SessionDescription(SessionDescription.Type.ANSWER, answerSdp)
                         activePc.setRemoteDescription(
                             object : SimpleSdpObserver() {
                                 override fun onSetSuccess() {
-                                    _p2pConnectionStatus.value = "تم استلام SDP Answer • جاري فتح قناة البيانات P2P..."
+                                    synchronized(signalingLock) {
+                                        isRemoteDescriptionSet = true
+                                        val queued = pendingServerCandidates.toList()
+                                        pendingServerCandidates.clear()
+                                        for (candidate in queued) {
+                                            try {
+                                                activePc.addIceCandidate(candidate)
+                                            } catch (_: Throwable) {
+                                            }
+                                        }
+                                    }
+                                    _p2pConnectionStatus.value = "تم استلام SDP Answer وتطبيق مرشحات STUN • جاري فتح DataChannel..."
+                                }
+
+                                override fun onSetFailure(error: String?) {
+                                    synchronized(signalingLock) {
+                                        isRemoteAnswerStarted = false
+                                    }
                                 }
                             },
                             answerDesc
                         )
                     } catch (_: Throwable) {
-                    }
-                }
-
-                if (serverCandidatesJson.isNotBlank()) {
-                    try {
-                        val arr = JSONArray(serverCandidatesJson)
-                        for (i in 0 until arr.length()) {
-                            val cObj = arr.getJSONObject(i)
-                            val sdp = cObj.optString("sdp")
-                            val sdpMid = cObj.optString("sdpMid")
-                            val sdpMLineIndex = cObj.optInt("sdpMLineIndex", 0)
-                            val key = "$sdpMid:$sdpMLineIndex:$sdp"
-                            if (sdp.isNotBlank() && addedServerCandidates.add(key)) {
-                                activePc.addIceCandidate(IceCandidate(sdpMid, sdpMLineIndex, sdp))
-                            }
-                        }
-                    } catch (_: Throwable) {
+                        isRemoteAnswerStarted = false
                     }
                 }
             }
@@ -356,6 +465,22 @@ class WebRtcP2pClientManager(
                 if (error != null || snapshot == null || !snapshot.exists()) return@addSnapshotListener
                 processAnswerAndServerCandidates(
                     incomingSessionId = snapshot.getString("sessionId").orEmpty(),
+                    offerSdpInDoc = snapshot.getString("offerSdp").orEmpty(),
+                    answerSdp = snapshot.getString("answerSdp").orEmpty(),
+                    answerType = snapshot.getString("answerType").orEmpty(),
+                    serverCandidatesJson = snapshot.getString("serverCandidatesJson").orEmpty()
+                )
+            }
+        } catch (_: Throwable) {
+        }
+
+        // Also listen via legacy Firestore path (`users/{uid}/webrtc_signaling/main`)
+        try {
+            legacyFirestoreSignalingRegistration = legacySignalingDoc?.addSnapshotListener { snapshot, error ->
+                if (error != null || snapshot == null || !snapshot.exists()) return@addSnapshotListener
+                processAnswerAndServerCandidates(
+                    incomingSessionId = snapshot.getString("sessionId").orEmpty(),
+                    offerSdpInDoc = snapshot.getString("offerSdp").orEmpty(),
                     answerSdp = snapshot.getString("answerSdp").orEmpty(),
                     answerType = snapshot.getString("answerType").orEmpty(),
                     serverCandidatesJson = snapshot.getString("serverCandidatesJson").orEmpty()
@@ -370,6 +495,7 @@ class WebRtcP2pClientManager(
                 override fun onDataChange(snapshot: DataSnapshot) {
                     processAnswerAndServerCandidates(
                         incomingSessionId = snapshot.child("sessionId").getValue(String::class.java).orEmpty(),
+                        offerSdpInDoc = snapshot.child("offerSdp").getValue(String::class.java).orEmpty(),
                         answerSdp = snapshot.child("answerSdp").getValue(String::class.java).orEmpty(),
                         answerType = snapshot.child("answerType").getValue(String::class.java).orEmpty(),
                         serverCandidatesJson = snapshot.child("serverCandidatesJson").getValue(String::class.java).orEmpty()
@@ -385,7 +511,7 @@ class WebRtcP2pClientManager(
             }
         }
 
-        // Create SDP Offer and publish to `users/{uid}/signaling`
+        // Create SDP Offer and publish to `users/{uid}/signaling` WITHOUT overwriting already-gathered Admin candidates
         try {
             val constraints = MediaConstraints().apply {
                 mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "true"))
@@ -395,10 +521,14 @@ class WebRtcP2pClientManager(
                 object : SimpleSdpObserver() {
                     override fun onCreateSuccess(desc: SessionDescription?) {
                         if (desc == null) return
+                        localOfferSdpText = desc.description
                         try {
                             pc.setLocalDescription(
                                 object : SimpleSdpObserver() {
                                     override fun onSetSuccess() {
+                                        val currentAdminCandidates = synchronized(adminCandidatesArray) {
+                                            adminCandidatesArray.toString()
+                                        }
                                         publishSignalingFields(
                                             mapOf(
                                                 "userId" to userId,
@@ -408,11 +538,11 @@ class WebRtcP2pClientManager(
                                                 "answerSdp" to "",
                                                 "answerType" to "",
                                                 "serverCandidatesJson" to "[]",
-                                                "adminCandidatesJson" to "[]",
+                                                "adminCandidatesJson" to currentAdminCandidates,
                                                 "updatedAt" to System.currentTimeMillis()
                                             )
                                         )
-                                        _p2pConnectionStatus.value = "تم إرسال SDP Offer عبر السحابة • بانتظار رد هاتف المنزل..."
+                                        _p2pConnectionStatus.value = "تم إرسال SDP Offer مع خوادم Google STUN • بانتظار رد هاتف المنزل..."
                                     }
                                 },
                                 desc
@@ -425,10 +555,33 @@ class WebRtcP2pClientManager(
             )
         } catch (_: Throwable) {
         }
+
+        // Watchdog: if DataChannel hasn't opened after 8 seconds, automatically re-negotiate once
+        negotiationWatchdogJob = scope.launch {
+            delay(8_000L)
+            if (isActive && activeSessionId == sessionId && !_isP2pConnected.value) {
+                val dcState = try { commandDataChannel?.state() } catch (_: Throwable) { null }
+                if (dcState != DataChannel.State.OPEN) {
+                    connectToHomeNodeP2p(
+                        userId = userId,
+                        secretToken = activeSecretToken,
+                        forceReconnect = true
+                    )
+                }
+            }
+        }
     }
 
     private fun attachDataChannelObserver(channel: DataChannel) {
         commandDataChannel = channel
+        try {
+            if (channel.state() == DataChannel.State.OPEN) {
+                _isP2pConnected.value = true
+                _p2pConnectionStatus.value = "متصل عالمياً عبر WebRTC P2P (RTCDataChannel OPEN)"
+            }
+        } catch (_: Throwable) {
+        }
+
         try {
             channel.registerObserver(
                 object : DataChannel.Observer {
@@ -809,7 +962,7 @@ class WebRtcP2pClientManager(
                     // Respect DataChannel backpressure
                     var waitLoops = 0
                     while (try { dc.bufferedAmount() > 1_048_576L } catch (_: Throwable) { false } && waitLoops < 100) {
-                        kotlinx.coroutines.delay(25L)
+                        delay(25L)
                         waitLoops++
                     }
 
@@ -858,11 +1011,21 @@ class WebRtcP2pClientManager(
 
     @Synchronized
     private fun cleanupActiveConnectionOnly() {
+        negotiationWatchdogJob?.cancel()
+        negotiationWatchdogJob = null
+
         try {
             firestoreSignalingRegistration?.remove()
         } catch (_: Throwable) {
         }
         firestoreSignalingRegistration = null
+
+        try {
+            legacyFirestoreSignalingRegistration?.remove()
+        } catch (_: Throwable) {
+        }
+        legacyFirestoreSignalingRegistration = null
+
         try {
             rtdbSignalingListener?.let { rtdbSignalingRef?.removeEventListener(it) }
         } catch (_: Throwable) {
@@ -957,11 +1120,10 @@ class WebRtcP2pClientManager(
                 return try {
                     val appCtx = context.applicationContext
                     if (!isNativeRuntimeInitialized) {
-                        PeerConnectionFactory.initialize(
-                            PeerConnectionFactory.InitializationOptions.builder(appCtx)
-                                .setEnableInternalTracer(false)
-                                .createInitializationOptions()
-                        )
+                        PeerConnectionFactory.InitializationOptions.builder(appCtx)
+                            .setEnableInternalTracer(false)
+                            .createInitializationOptions()
+                            .let { PeerConnectionFactory.initialize(it) }
                         isNativeRuntimeInitialized = true
                     }
 

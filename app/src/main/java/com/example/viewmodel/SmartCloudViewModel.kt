@@ -114,12 +114,20 @@ class SmartCloudViewModel(
                 }
         }
 
-        // Automatically reload directory over RTCDataChannel as soon as P2P tunnel transitions to OPEN
+        // Automatically reload directory & status over RTCDataChannel as soon as P2P tunnel transitions to OPEN
         if (p2pClientManager != null) {
             p2pStateWatcherJob = viewModelScope.launch {
                 p2pClientManager.isP2pConnected.collect { connected ->
-                    if (connected && _selectedMode.value == AppMode.ADMIN_CONTROLLER && _remoteFiles.value.isEmpty()) {
-                        loadRemoteDirectory(_currentRemotePath.value)
+                    if (connected) {
+                        val node = _discoveredHomeNode.value
+                        if (node != null) {
+                            repository.pingHomeNodeStatus(node, p2pClientManager).onSuccess { refreshed ->
+                                _discoveredHomeNode.value = refreshed
+                            }
+                        }
+                        if (_selectedMode.value == AppMode.ADMIN_CONTROLLER) {
+                            loadRemoteDirectory(_currentRemotePath.value)
+                        }
                     }
                 }
             }
@@ -294,12 +302,10 @@ class SmartCloudViewModel(
                 val node = _discoveredHomeNode.value
                 val uid = _currentUser.value?.uid.orEmpty()
                 if (node != null && node.isOnline) {
-                    if (!isServerRunning.value) {
-                        p2pClientManager?.connectToHomeNodeP2p(
-                            userId = uid.ifBlank { node.userId },
-                            secretToken = node.secretToken
-                        )
-                    }
+                    p2pClientManager?.connectToHomeNodeP2p(
+                        userId = uid.ifBlank { node.userId },
+                        secretToken = node.secretToken
+                    )
                     if (mode == AppMode.ADMIN_CONTROLLER) {
                         loadRemoteDirectory(dirPath = _currentRemotePath.value)
                     }
@@ -415,12 +421,10 @@ class SmartCloudViewModel(
                     val currentMode = _selectedMode.value
                     val isAdminMode = currentMode == AppMode.ADMIN_CONTROLLER || currentMode == AppMode.SCREEN_MIRRORING
                     if (nodeInfo != null && nodeInfo.isOnline && isAdminMode) {
-                        if (!isServerRunning.value) {
-                            p2pClientManager?.connectToHomeNodeP2p(
-                                userId = uid,
-                                secretToken = nodeInfo.secretToken
-                            )
-                        }
+                        p2pClientManager?.connectToHomeNodeP2p(
+                            userId = uid,
+                            secretToken = nodeInfo.secretToken
+                        )
                         val endpointKey = "${nodeInfo.effectiveSignalingPath()}:${nodeInfo.secretToken}"
                         if (lastAutoLoadedNodeKey != endpointKey && currentMode == AppMode.ADMIN_CONTROLLER) {
                             lastAutoLoadedNodeKey = endpointKey
