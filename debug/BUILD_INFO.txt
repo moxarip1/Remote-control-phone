@@ -1,0 +1,8 @@
+Application: Smart Home Cloud (Single APK)
+Updated At (Epoch ms): 1792339894782
+Source APK: /app/applet/.build-outputs/app-debug.apk (56377001 bytes)
+Included Updates:
+- Email/Password Login, Account Creation & Password Reset + Google Sign-In
+- Global WebRTC P2P Architecture (RTCDataChannel + 30 FPS Live Stream via users/{uid}/signaling)
+- Dual Screen Mirroring (/screenshot Polling + WebRTC SurfaceViewRenderer)
+- Optional & Skippable POST_NOTIFICATIONS Permission (Silent Background Server Mode without crash)

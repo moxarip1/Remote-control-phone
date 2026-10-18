@@ -88,25 +88,41 @@ val syncDebugApkToRootFolder by tasks.registering {
   val targetDebugDir = rootDebugDir
   val fallbackApk = fallbackBuiltApk
   val primaryApkProvider = moduleBuildDir.file("outputs/apk/debug/app-debug.apk")
+  outputs.upToDateWhen { false }
   doLast {
     if (!targetDebugDir.exists()) {
       targetDebugDir.mkdirs()
     }
     val primaryApk = primaryApkProvider.get().asFile
-    val sourceApk = when {
-      primaryApk.exists() -> primaryApk
-      fallbackApk.exists() -> fallbackApk
-      else -> null
-    }
+    val sourceApk = listOf(primaryApk, fallbackApk)
+      .filter { it.exists() && it.length() > 0L }
+      .maxByOrNull { it.lastModified() }
+
     if (sourceApk != null) {
-      sourceApk.copyTo(File(targetDebugDir, "debug.apk"), overwrite = true)
-      sourceApk.copyTo(File(targetDebugDir, "SmartHomeCloud-debug.apk"), overwrite = true)
+      val debugApkDest = File(targetDebugDir, "debug.apk")
+      val namedApkDest = File(targetDebugDir, "SmartHomeCloud-debug.apk")
+      sourceApk.copyTo(debugApkDest, overwrite = true)
+      sourceApk.copyTo(namedApkDest, overwrite = true)
+      File(targetDebugDir, "BUILD_INFO.txt").writeText(
+        "Application: Smart Home Cloud (Single APK)\n" +
+          "Updated At (Epoch ms): ${System.currentTimeMillis()}\n" +
+          "Source APK: ${sourceApk.absolutePath} (${sourceApk.length()} bytes)\n" +
+          "Included Updates:\n" +
+          "- Email/Password Login, Account Creation & Password Reset + Google Sign-In\n" +
+          "- Global WebRTC P2P Architecture (RTCDataChannel + 30 FPS Live Stream via users/{uid}/signaling)\n" +
+          "- Dual Screen Mirroring (/screenshot Polling + WebRTC SurfaceViewRenderer)\n" +
+          "- Optional & Skippable POST_NOTIFICATIONS Permission (Silent Background Server Mode without crash)\n"
+      )
     }
   }
 }
 
 tasks.configureEach {
-  if (name == "assembleDebug" || name == "packageDebug") {
+  if (
+    name == "assembleDebug" ||
+    name == "packageDebug" ||
+    name == "createDebugApkListingFileRedirect"
+  ) {
     finalizedBy(syncDebugApkToRootFolder)
   }
 }
