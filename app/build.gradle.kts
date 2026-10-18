@@ -79,6 +79,38 @@ tasks.withType<Test> {
   }
 }
 
+// Automatically sync the latest compiled debug APK to /debug/debug.apk on every build & future update
+val rootDebugDir = rootProject.layout.projectDirectory.dir("debug").asFile
+val fallbackBuiltApk = rootProject.layout.projectDirectory.file(".build-outputs/app-debug.apk").asFile
+val moduleBuildDir = layout.buildDirectory
+
+val syncDebugApkToRootFolder by tasks.registering {
+  val targetDebugDir = rootDebugDir
+  val fallbackApk = fallbackBuiltApk
+  val primaryApkProvider = moduleBuildDir.file("outputs/apk/debug/app-debug.apk")
+  doLast {
+    if (!targetDebugDir.exists()) {
+      targetDebugDir.mkdirs()
+    }
+    val primaryApk = primaryApkProvider.get().asFile
+    val sourceApk = when {
+      primaryApk.exists() -> primaryApk
+      fallbackApk.exists() -> fallbackApk
+      else -> null
+    }
+    if (sourceApk != null) {
+      sourceApk.copyTo(File(targetDebugDir, "debug.apk"), overwrite = true)
+      sourceApk.copyTo(File(targetDebugDir, "SmartHomeCloud-debug.apk"), overwrite = true)
+    }
+  }
+}
+
+tasks.configureEach {
+  if (name == "assembleDebug" || name == "packageDebug") {
+    finalizedBy(syncDebugApkToRootFolder)
+  }
+}
+
 // Configure the Secrets Gradle Plugin to use .env and .env.example files
 // to match the convention used in Web projects.
 secrets {
