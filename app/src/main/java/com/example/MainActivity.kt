@@ -122,7 +122,13 @@ fun SmartHomeCloudRootApp(
     if (currentUser == null) {
         AuthScreen(
             isLoading = isAuthLoading,
+            statusMessage = statusBanner,
             errorMessage = errorBanner,
+            onEmailSignInClick = { email, password -> viewModel.signInWithEmail(email, password) },
+            onEmailSignUpClick = { email, password, confirmPassword ->
+                viewModel.signUpWithEmail(email, password, confirmPassword)
+            },
+            onResetPasswordClick = { email -> viewModel.resetPassword(email) },
             onGoogleSignInClick = { viewModel.signInWithGoogle(activity) },
             onDismissError = { viewModel.clearBanners() }
         )

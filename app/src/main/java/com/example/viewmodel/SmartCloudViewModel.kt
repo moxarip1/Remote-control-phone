@@ -109,6 +109,121 @@ class SmartCloudViewModel(
         }
     }
 
+    fun signInWithEmail(email: String, password: String) {
+        val trimmedEmail = email.trim()
+        if (trimmedEmail.isBlank()) {
+            _errorBannerMessage.value = "يرجى إدخال البريد الإلكتروني"
+            return
+        }
+        if (!android.util.Patterns.EMAIL_ADDRESS.matcher(trimmedEmail).matches()) {
+            _errorBannerMessage.value = "يرجى إدخال عنوان بريد إلكتروني صحيح"
+            return
+        }
+        if (password.isBlank()) {
+            _errorBannerMessage.value = "يرجى إدخال كلمة المرور"
+            return
+        }
+
+        viewModelScope.launch {
+            _isAuthLoading.value = true
+            _errorBannerMessage.value = null
+            _statusBannerMessage.value = null
+            val result = repository.signInWithEmailAndPassword(trimmedEmail, password)
+            _isAuthLoading.value = false
+            result.onFailure { error ->
+                _errorBannerMessage.value = mapFirebaseAuthErrorToArabic(error, isSignUp = false)
+            }
+        }
+    }
+
+    fun signUpWithEmail(email: String, password: String, confirmPassword: String) {
+        val trimmedEmail = email.trim()
+        if (trimmedEmail.isBlank()) {
+            _errorBannerMessage.value = "يرجى إدخال البريد الإلكتروني لإنشاء الحساب"
+            return
+        }
+        if (!android.util.Patterns.EMAIL_ADDRESS.matcher(trimmedEmail).matches()) {
+            _errorBannerMessage.value = "يرجى إدخال عنوان بريد إلكتروني صحيح"
+            return
+        }
+        if (password.length < 6) {
+            _errorBannerMessage.value = "يجب أن تتكون كلمة المرور من 6 أحرف أو أرقام على الأقل"
+            return
+        }
+        if (confirmPassword.isNotEmpty() && password != confirmPassword) {
+            _errorBannerMessage.value = "كلمتا المرور غير متطابقتين، يرجى التأكد من كتابتهما بشكل متطابق"
+            return
+        }
+
+        viewModelScope.launch {
+            _isAuthLoading.value = true
+            _errorBannerMessage.value = null
+            _statusBannerMessage.value = null
+            val result = repository.signUpWithEmailAndPassword(trimmedEmail, password)
+            _isAuthLoading.value = false
+            result.onFailure { error ->
+                _errorBannerMessage.value = mapFirebaseAuthErrorToArabic(error, isSignUp = true)
+            }
+        }
+    }
+
+    fun resetPassword(email: String) {
+        val trimmedEmail = email.trim()
+        if (trimmedEmail.isBlank()) {
+            _errorBannerMessage.value = "يرجى كتابة بريدك الإلكتروني أولاً في الحقل المخصص ثم الضغط على استعادة كلمة المرور"
+            return
+        }
+        if (!android.util.Patterns.EMAIL_ADDRESS.matcher(trimmedEmail).matches()) {
+            _errorBannerMessage.value = "يرجى إدخال عنوان بريد إلكتروني صحيح لإرسال رابط الاستعادة"
+            return
+        }
+
+        viewModelScope.launch {
+            _isAuthLoading.value = true
+            _errorBannerMessage.value = null
+            _statusBannerMessage.value = null
+            val result = repository.sendPasswordResetEmail(trimmedEmail)
+            _isAuthLoading.value = false
+            result.onSuccess {
+                _statusBannerMessage.value = "تم إرسال رابط إعادة تعيين كلمة المرور إلى $trimmedEmail"
+            }.onFailure { error ->
+                _errorBannerMessage.value = mapFirebaseAuthErrorToArabic(error, isSignUp = false)
+            }
+        }
+    }
+
+    private fun mapFirebaseAuthErrorToArabic(error: Throwable, isSignUp: Boolean): String {
+        val msg = error.message.orEmpty()
+        return when {
+            msg.contains("ERROR_INVALID_EMAIL", ignoreCase = true) ||
+                msg.contains("badly formatted", ignoreCase = true) ->
+                "صيغة البريد الإلكتروني غير صحيحة."
+            msg.contains("ERROR_WRONG_PASSWORD", ignoreCase = true) ||
+                msg.contains("INVALID_LOGIN_CREDENTIALS", ignoreCase = true) ||
+                msg.contains("invalid credential", ignoreCase = true) ->
+                "البريد الإلكتروني أو كلمة المرور غير صحيحة."
+            msg.contains("ERROR_USER_NOT_FOUND", ignoreCase = true) ||
+                msg.contains("no user record", ignoreCase = true) ->
+                "لا يوجد حساب مسجل بهذا البريد الإلكتروني. يمكنك التبديل إلى تبويب «إنشاء حساب جديد»."
+            msg.contains("ERROR_EMAIL_ALREADY_IN_USE", ignoreCase = true) ||
+                msg.contains("already in use", ignoreCase = true) ->
+                "هذا البريد الإلكتروني مسجل مسبقاً. يمكنك تسجيل الدخول مباشرة."
+            msg.contains("ERROR_WEAK_PASSWORD", ignoreCase = true) ->
+                "كلمة المرور ضعيفة جداً، يجب أن تتكون من 6 أحرف على الأقل."
+            msg.contains("CONFIGURATION_NOT_FOUND", ignoreCase = true) ||
+                msg.contains("OPERATION_NOT_ALLOWED", ignoreCase = true) ->
+                "مصادقة البريد الإلكتروني غير مفعّلة بعد أو تتطلب التحقق من إعدادات مشروع Firebase."
+            msg.contains("network error", ignoreCase = true) ||
+                msg.contains("UNAVAILABLE", ignoreCase = true) ->
+                "تعذر الاتصال بالشبكة، يرجى التحقق من اتصال الإنترنت والمحاولة مجدداً."
+            else -> error.localizedMessage ?: if (isSignUp) {
+                "تعذر إنشاء الحساب الجديد، يرجى المحاولة مرة أخرى"
+            } else {
+                "تعذر تسجيل الدخول، يرجى التحقق من البيانات والمحاولة مرة أخرى"
+            }
+        }
+    }
+
     fun signInWithGoogle(activity: Activity) {
         viewModelScope.launch {
             _isAuthLoading.value = true

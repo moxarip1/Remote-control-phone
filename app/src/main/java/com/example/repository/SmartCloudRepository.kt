@@ -205,6 +205,68 @@ class SmartCloudRepository(
         }
     }
 
+    /**
+     * Sign in with Email and Password via Firebase Authentication.
+     */
+    suspend fun signInWithEmailAndPassword(email: String, password: String): Result<FirebaseUser> {
+        val trimmedEmail = email.trim()
+        if (trimmedEmail.isBlank() || password.isBlank()) {
+            return Result.failure(IllegalArgumentException("يرجى إدخال البريد الإلكتروني وكلمة المرور"))
+        }
+        return try {
+            val authResult = auth.signInWithEmailAndPassword(trimmedEmail, password).await()
+            val user = checkNotNull(authResult.user) { "تعذر العثور على بيانات المستخدم بعد تسجيل الدخول" }
+            Result.success(user)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Email/Password Sign-In failed", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Create a new account with Email and Password via Firebase Authentication.
+     */
+    suspend fun signUpWithEmailAndPassword(email: String, password: String): Result<FirebaseUser> {
+        val trimmedEmail = email.trim()
+        if (trimmedEmail.isBlank() || password.isBlank()) {
+            return Result.failure(IllegalArgumentException("يرجى إدخال البريد الإلكتروني وكلمة المرور"))
+        }
+        if (password.length < 6) {
+            return Result.failure(IllegalArgumentException("يجب أن تتكون كلمة المرور من 6 أحرف على الأقل"))
+        }
+        return try {
+            val authResult = auth.createUserWithEmailAndPassword(trimmedEmail, password).await()
+            val user = checkNotNull(authResult.user) { "تعذر إنشاء الحساب الجديد" }
+            Result.success(user)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Email/Password Sign-Up failed", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Send a password reset email via Firebase Authentication.
+     */
+    suspend fun sendPasswordResetEmail(email: String): Result<Unit> {
+        val trimmedEmail = email.trim()
+        if (trimmedEmail.isBlank()) {
+            return Result.failure(IllegalArgumentException("يرجى إدخال البريد الإلكتروني أولاً لإرسال رابط استعادة كلمة المرور"))
+        }
+        return try {
+            auth.sendPasswordResetEmail(trimmedEmail).await()
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Password reset failed", e)
+            Result.failure(e)
+        }
+    }
+
     suspend fun signOut(context: Context) {
         auth.signOut()
         try {

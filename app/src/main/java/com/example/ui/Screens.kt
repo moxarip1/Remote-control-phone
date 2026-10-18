@@ -113,6 +113,27 @@ import com.example.model.ServerLog
 import com.example.model.TransferProgress
 import java.io.File
 
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.filled.Email
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.PersonAdd
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.filled.VpnKey
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+
 data class SystemPermissionsState(
     val hasStorageAccess: Boolean,
     val hasNotificationPermission: Boolean,
@@ -123,16 +144,28 @@ data class SystemPermissionsState(
 }
 
 // =============================================================================
-// 1. AUTH SCREEN (Unified Cloud Sign-In Screen)
+// 1. AUTH SCREEN (Unified Cloud Sign-In & Sign-Up Screen: Email/Password + Google)
 // =============================================================================
 
 @Composable
 fun AuthScreen(
     isLoading: Boolean,
+    statusMessage: String? = null,
     errorMessage: String?,
+    onEmailSignInClick: (email: String, password: String) -> Unit = { _, _ -> },
+    onEmailSignUpClick: (email: String, password: String, confirmPassword: String) -> Unit = { _, _, _ -> },
+    onResetPasswordClick: (email: String) -> Unit = {},
     onGoogleSignInClick: () -> Unit,
     onDismissError: () -> Unit
 ) {
+    var isSignUpMode by rememberSaveable { mutableStateOf(false) }
+    var email by rememberSaveable { mutableStateOf("") }
+    var password by rememberSaveable { mutableStateOf("") }
+    var confirmPassword by rememberSaveable { mutableStateOf("") }
+    var isPasswordVisible by rememberSaveable { mutableStateOf(false) }
+    var isConfirmPasswordVisible by rememberSaveable { mutableStateOf(false) }
+    val focusManager = LocalFocusManager.current
+
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
         Scaffold(
             contentWindowInsets = WindowInsets.safeDrawing
@@ -163,19 +196,19 @@ fun AuthScreen(
                         shape = CircleShape,
                         color = MaterialTheme.colorScheme.primaryContainer,
                         tonalElevation = 8.dp,
-                        modifier = Modifier.size(96.dp)
+                        modifier = Modifier.size(88.dp)
                     ) {
                         Box(contentAlignment = Alignment.Center) {
                             Icon(
                                 imageVector = Icons.Default.Cloud,
                                 contentDescription = "شعار السحابة المنزلية الذكية",
                                 tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(52.dp)
+                                modifier = Modifier.size(48.dp)
                             )
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(20.dp))
+                    Spacer(modifier = Modifier.height(16.dp))
 
                     Text(
                         text = "Smart Home Cloud",
@@ -184,7 +217,7 @@ fun AuthScreen(
                         color = MaterialTheme.colorScheme.onBackground
                     )
 
-                    Spacer(modifier = Modifier.height(8.dp))
+                    Spacer(modifier = Modifier.height(6.dp))
 
                     Text(
                         text = "نظام السحابة المنزلية الذكية للربط التلقائي بين هاتف المنزل الخادم وهاتف التحكم عن بُعد بدون إدخال عناوين IP يدوياً",
@@ -193,8 +226,45 @@ fun AuthScreen(
                         textAlign = TextAlign.Center
                     )
 
-                    Spacer(modifier = Modifier.height(28.dp))
+                    Spacer(modifier = Modifier.height(20.dp))
 
+                    // Status Banner (e.g., Password Reset Link Sent)
+                    AnimatedVisibility(visible = !statusMessage.isNullOrBlank()) {
+                        Card(
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.primaryContainer
+                            ),
+                            shape = RoundedCornerShape(16.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = 14.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(14.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.CheckCircle,
+                                    contentDescription = "إشعار نجاح",
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Text(
+                                    text = statusMessage.orEmpty(),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                TextButton(onClick = onDismissError) {
+                                    Text("إغلاق")
+                                }
+                            }
+                        }
+                    }
+
+                    // Error Banner
                     AnimatedVisibility(visible = !errorMessage.isNullOrBlank()) {
                         Card(
                             colors = CardDefaults.cardColors(
@@ -203,12 +273,12 @@ fun AuthScreen(
                             shape = RoundedCornerShape(16.dp),
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(bottom = 16.dp)
+                                .padding(bottom = 14.dp)
                         ) {
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(16.dp),
+                                    .padding(14.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Icon(
@@ -238,58 +308,361 @@ fun AuthScreen(
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(24.dp),
+                                .padding(20.dp),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
+                            // Tabs: Sign In vs Create Account
+                            TabRow(
+                                selectedTabIndex = if (isSignUpMode) 1 else 0,
+                                containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(14.dp))
+                            ) {
+                                Tab(
+                                    selected = !isSignUpMode,
+                                    onClick = {
+                                        isSignUpMode = false
+                                        onDismissError()
+                                    },
+                                    modifier = Modifier.testTag("tab_sign_in"),
+                                    text = {
+                                        Text(
+                                            text = "تسجيل الدخول",
+                                            fontWeight = if (!isSignUpMode) FontWeight.Bold else FontWeight.Normal
+                                        )
+                                    },
+                                    icon = {
+                                        Icon(
+                                            imageVector = Icons.Default.VpnKey,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                )
+                                Tab(
+                                    selected = isSignUpMode,
+                                    onClick = {
+                                        isSignUpMode = true
+                                        onDismissError()
+                                    },
+                                    modifier = Modifier.testTag("tab_sign_up"),
+                                    text = {
+                                        Text(
+                                            text = "إنشاء حساب جديد",
+                                            fontWeight = if (isSignUpMode) FontWeight.Bold else FontWeight.Normal
+                                        )
+                                    },
+                                    icon = {
+                                        Icon(
+                                            imageVector = Icons.Default.PersonAdd,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(16.dp))
+
                             Text(
-                                text = "تسجيل الدخول الموحد للسحابة",
-                                style = MaterialTheme.typography.titleLarge,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                text = "سجّل الدخول بنفس حساب Google على هاتف المنزل (Server) وهاتفك الشخصي (Admin) ليتم الاكتشاف والمزامنة اللحظية تلقائياً.",
+                                text = if (isSignUpMode) {
+                                    "أنشئ حساباً سحابياً موحداً بالبريد الإلكتروني وكلمة المرور لربط هاتف المنزل وهاتف التحكم تلقائياً"
+                                } else {
+                                    "سجّل الدخول بنفس الحساب على هاتف المنزل (Server) وهاتفك الشخصي (Admin) ليتم الاكتشاف والمزامنة اللحظية"
+                                },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 textAlign = TextAlign.Center
                             )
 
-                            Spacer(modifier = Modifier.height(24.dp))
+                            Spacer(modifier = Modifier.height(16.dp))
 
+                            // Email Input Field
+                            OutlinedTextField(
+                                value = email,
+                                onValueChange = { email = it },
+                                label = { Text("البريد الإلكتروني (Email)") },
+                                placeholder = { Text("example@domain.com") },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Default.Email,
+                                        contentDescription = "أيقونة البريد الإلكتروني"
+                                    )
+                                },
+                                singleLine = true,
+                                enabled = !isLoading,
+                                keyboardOptions = KeyboardOptions(
+                                    keyboardType = KeyboardType.Email,
+                                    imeAction = ImeAction.Next
+                                ),
+                                shape = RoundedCornerShape(14.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("email_input_field")
+                            )
+
+                            Spacer(modifier = Modifier.height(12.dp))
+
+                            // Password Input Field
+                            OutlinedTextField(
+                                value = password,
+                                onValueChange = { password = it },
+                                label = { Text("كلمة المرور (Password)") },
+                                placeholder = { Text("6 أحرف أو أرقام على الأقل") },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Default.Lock,
+                                        contentDescription = "أيقونة كلمة المرور"
+                                    )
+                                },
+                                trailingIcon = {
+                                    IconButton(
+                                        onClick = { isPasswordVisible = !isPasswordVisible },
+                                        modifier = Modifier.testTag("toggle_password_visibility")
+                                    ) {
+                                        Icon(
+                                            imageVector = if (isPasswordVisible) {
+                                                Icons.Default.VisibilityOff
+                                            } else {
+                                                Icons.Default.Visibility
+                                            },
+                                            contentDescription = if (isPasswordVisible) {
+                                                "إخفاء كلمة المرور"
+                                            } else {
+                                                "إظهار كلمة المرور"
+                                            }
+                                        )
+                                    }
+                                },
+                                visualTransformation = if (isPasswordVisible) {
+                                    VisualTransformation.None
+                                } else {
+                                    PasswordVisualTransformation()
+                                },
+                                singleLine = true,
+                                enabled = !isLoading,
+                                keyboardOptions = KeyboardOptions(
+                                    keyboardType = KeyboardType.Password,
+                                    imeAction = if (isSignUpMode) ImeAction.Next else ImeAction.Done
+                                ),
+                                keyboardActions = KeyboardActions(
+                                    onDone = {
+                                        if (!isSignUpMode) {
+                                            focusManager.clearFocus()
+                                            onEmailSignInClick(email, password)
+                                        }
+                                    }
+                                ),
+                                shape = RoundedCornerShape(14.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("password_input_field")
+                            )
+
+                            // Confirm Password Field (Only in Sign-Up Mode)
+                            AnimatedVisibility(visible = isSignUpMode) {
+                                Column(modifier = Modifier.fillMaxWidth()) {
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                    OutlinedTextField(
+                                        value = confirmPassword,
+                                        onValueChange = { confirmPassword = it },
+                                        label = { Text("تأكيد كلمة المرور") },
+                                        placeholder = { Text("أعد كتابة كلمة المرور للتأكيد") },
+                                        leadingIcon = {
+                                            Icon(
+                                                imageVector = Icons.Default.Key,
+                                                contentDescription = "أيقونة تأكيد كلمة المرور"
+                                            )
+                                        },
+                                        trailingIcon = {
+                                            IconButton(
+                                                onClick = {
+                                                    isConfirmPasswordVisible = !isConfirmPasswordVisible
+                                                },
+                                                modifier = Modifier.testTag("toggle_confirm_password_visibility")
+                                            ) {
+                                                Icon(
+                                                    imageVector = if (isConfirmPasswordVisible) {
+                                                        Icons.Default.VisibilityOff
+                                                    } else {
+                                                        Icons.Default.Visibility
+                                                    },
+                                                    contentDescription = if (isConfirmPasswordVisible) {
+                                                        "إخفاء تأكيد كلمة المرور"
+                                                    } else {
+                                                        "إظهار تأكيد كلمة المرور"
+                                                    }
+                                                )
+                                            }
+                                        },
+                                        visualTransformation = if (isConfirmPasswordVisible) {
+                                            VisualTransformation.None
+                                        } else {
+                                            PasswordVisualTransformation()
+                                        },
+                                        singleLine = true,
+                                        enabled = !isLoading,
+                                        keyboardOptions = KeyboardOptions(
+                                            keyboardType = KeyboardType.Password,
+                                            imeAction = ImeAction.Done
+                                        ),
+                                        keyboardActions = KeyboardActions(
+                                            onDone = {
+                                                focusManager.clearFocus()
+                                                onEmailSignUpClick(email, password, confirmPassword)
+                                            }
+                                        ),
+                                        shape = RoundedCornerShape(14.dp),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .testTag("confirm_password_input_field")
+                                    )
+                                }
+                            }
+
+                            // Forgot Password Button (Only in Sign-In Mode)
+                            if (!isSignUpMode) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.End
+                                ) {
+                                    TextButton(
+                                        onClick = {
+                                            focusManager.clearFocus()
+                                            onResetPasswordClick(email)
+                                        },
+                                        enabled = !isLoading,
+                                        modifier = Modifier.testTag("forgot_password_button")
+                                    ) {
+                                        Text(
+                                            text = "نسيت كلمة المرور؟ استعادة عبر البريد",
+                                            style = MaterialTheme.typography.labelMedium
+                                        )
+                                    }
+                                }
+                            } else {
+                                Spacer(modifier = Modifier.height(16.dp))
+                            }
+
+                            // Primary Submit Button (Email Sign-In OR Create Account)
                             Button(
-                                onClick = onGoogleSignInClick,
+                                onClick = {
+                                    focusManager.clearFocus()
+                                    if (isSignUpMode) {
+                                        onEmailSignUpClick(email, password, confirmPassword)
+                                    } else {
+                                        onEmailSignInClick(email, password)
+                                    }
+                                },
                                 enabled = !isLoading,
                                 shape = RoundedCornerShape(16.dp),
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .height(56.dp)
-                                    .testTag("google_sign_in_button")
+                                    .height(54.dp)
+                                    .testTag("email_auth_submit_button")
                             ) {
                                 if (isLoading) {
                                     CircularProgressIndicator(
-                                        modifier = Modifier.size(24.dp),
+                                        modifier = Modifier.size(22.dp),
                                         color = MaterialTheme.colorScheme.onPrimary,
                                         strokeWidth = 2.5.dp
                                     )
                                     Spacer(modifier = Modifier.width(12.dp))
-                                    Text("جاري التحقق من الحساب...")
+                                    Text(
+                                        if (isSignUpMode) "جاري إنشاء الحساب..." else "جاري تسجيل الدخول..."
+                                    )
                                 } else {
                                     Icon(
-                                        imageVector = Icons.Default.Security,
+                                        imageVector = if (isSignUpMode) {
+                                            Icons.Default.PersonAdd
+                                        } else {
+                                            Icons.Default.VpnKey
+                                        },
                                         contentDescription = null
                                     )
-                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Spacer(modifier = Modifier.width(10.dp))
                                     Text(
-                                        text = "Sign in with Google / الدخول عبر جوجل",
+                                        text = if (isSignUpMode) {
+                                            "إنشاء حساب جديد والدخول"
+                                        } else {
+                                            "تسجيل الدخول بالبريد وكلمة السر"
+                                        },
                                         style = MaterialTheme.typography.titleMedium,
                                         fontWeight = FontWeight.Bold
                                     )
                                 }
                             }
+
+                            Spacer(modifier = Modifier.height(14.dp))
+
+                            // Switch Mode Helper Button
+                            TextButton(
+                                onClick = {
+                                    isSignUpMode = !isSignUpMode
+                                    onDismissError()
+                                },
+                                enabled = !isLoading,
+                                modifier = Modifier.testTag("switch_auth_mode_button")
+                            ) {
+                                Text(
+                                    text = if (isSignUpMode) {
+                                        "لديك حساب بالفعل؟ اضغط هنا لتسجيل الدخول"
+                                    } else {
+                                        "ليس لديك حساب؟ اضغط هنا لإنشاء حساب جديد"
+                                    },
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                HorizontalDivider(modifier = Modifier.weight(1f))
+                                Text(
+                                    text = "  أو المتابعة السريعة عبر  ",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                HorizontalDivider(modifier = Modifier.weight(1f))
+                            }
+
+                            Spacer(modifier = Modifier.height(14.dp))
+
+                            // Secondary Option: Google Sign-In Button
+                            OutlinedButton(
+                                onClick = {
+                                    focusManager.clearFocus()
+                                    onGoogleSignInClick()
+                                },
+                                enabled = !isLoading,
+                                shape = RoundedCornerShape(16.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(52.dp)
+                                    .testTag("google_sign_in_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Security,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Text(
+                                    text = "الدخول السريع عبر حساب Google",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(24.dp))
+                    Spacer(modifier = Modifier.height(20.dp))
 
                     // Architecture Feature Summary Cards
                     Row(
