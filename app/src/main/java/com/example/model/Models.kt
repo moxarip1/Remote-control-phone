@@ -17,15 +17,24 @@ import kotlin.math.pow
 enum class AppMode {
     NONE,
     HOME_NODE_SERVER,
-    ADMIN_CONTROLLER
+    ADMIN_CONTROLLER,
+    SCREEN_MIRRORING
 }
 
+/**
+ * Represents the global WebRTC P2P state & telemetry of the Home Node Server.
+ * Instead of relying on a local Wi-Fi IP address, the Home Node and Admin Controller
+ * establish a direct encrypted WebRTC PeerConnection & RTCDataChannel via Firebase
+ * signaling at `users/{uid}/signaling`.
+ */
 @IgnoreExtraProperties
 data class HomeNodeInfo(
     @DocumentId val id: String = "main",
     val userId: String = "",
     val deviceName: String = "",
-    val ipAddress: String = "",
+    val signalingPath: String = "",
+    val p2pState: String = "WAITING_FOR_PEER",
+    val ipAddress: String = "WebRTC-P2P-Global",
     val port: Int = 8080,
     @get:PropertyName("isOnline")
     @field:PropertyName("isOnline")
@@ -40,6 +49,9 @@ data class HomeNodeInfo(
 ) {
     fun baseUrl(): String = "http://$ipAddress:$port"
 
+    fun effectiveSignalingPath(): String =
+        signalingPath.ifBlank { if (userId.isNotBlank()) "users/$userId/signaling" else "users/{uid}/signaling" }
+
     fun usedStorageBytes(): Long = (totalStorageBytes - freeStorageBytes).coerceAtLeast(0L)
 
     fun usedStorageFraction(): Float {
@@ -51,7 +63,9 @@ data class HomeNodeInfo(
         return mapOf(
             "userId" to uid,
             "deviceName" to deviceName.take(120).ifBlank { "Android Home Node" },
-            "ipAddress" to ipAddress.take(64),
+            "signalingPath" to "users/$uid/signaling",
+            "p2pState" to p2pState.take(64).ifBlank { "WAITING_FOR_PEER" },
+            "ipAddress" to ipAddress.take(64).ifBlank { "WebRTC-P2P-Global" },
             "port" to port.coerceIn(1024, 65535),
             "isOnline" to isOnline,
             "secretToken" to secretToken.take(128),
@@ -64,10 +78,12 @@ data class HomeNodeInfo(
         )
     }
 
-    fun toFirestoreUpdateMap(): Map<String, Any> {
+    fun toFirestoreUpdateMap(uid: String = userId): Map<String, Any> {
         return mapOf(
             "deviceName" to deviceName.take(120).ifBlank { "Android Home Node" },
-            "ipAddress" to ipAddress.take(64),
+            "signalingPath" to if (uid.isNotBlank()) "users/$uid/signaling" else signalingPath,
+            "p2pState" to p2pState.take(64).ifBlank { "WAITING_FOR_PEER" },
+            "ipAddress" to ipAddress.take(64).ifBlank { "WebRTC-P2P-Global" },
             "port" to port.coerceIn(1024, 65535),
             "isOnline" to isOnline,
             "secretToken" to secretToken.take(128),
@@ -79,10 +95,12 @@ data class HomeNodeInfo(
         )
     }
 
-    fun toRealtimeDbMap(): Map<String, Any> {
+    fun toRealtimeDbMap(uid: String = userId): Map<String, Any> {
         return mapOf(
             "deviceName" to deviceName.take(120).ifBlank { "Android Home Node" },
-            "ipAddress" to ipAddress.take(64),
+            "signalingPath" to if (uid.isNotBlank()) "users/$uid/signaling" else signalingPath,
+            "p2pState" to p2pState.take(64).ifBlank { "WAITING_FOR_PEER" },
+            "ipAddress" to ipAddress.take(64).ifBlank { "WebRTC-P2P-Global" },
             "port" to port.coerceIn(1024, 65535),
             "isOnline" to isOnline,
             "secretToken" to secretToken.take(128),
@@ -93,6 +111,23 @@ data class HomeNodeInfo(
         )
     }
 }
+
+/**
+ * Represents the WebRTC Signaling state synchronized via `users/{uid}/signaling`
+ * in Firebase Realtime Database and Firestore.
+ */
+@IgnoreExtraProperties
+data class WebRtcSignalingState(
+    val userId: String = "",
+    val sessionId: String = "",
+    val offerSdp: String = "",
+    val offerType: String = "",
+    val answerSdp: String = "",
+    val answerType: String = "",
+    val serverCandidatesJson: String = "[]",
+    val adminCandidatesJson: String = "[]",
+    val updatedAt: Long = System.currentTimeMillis()
+)
 
 data class RemoteFileItem(
     val name: String = "",
@@ -172,10 +207,10 @@ data class RemoteFileItem(
 data class ServerLog(
     val id: String = UUID.randomUUID().toString(),
     val timestamp: Long = System.currentTimeMillis(),
-    val method: String = "GET",
+    val method: String = "P2P",
     val endpoint: String = "",
     val message: String = "",
-    val clientIp: String = "",
+    val clientIp: String = "WebRTC-Peer",
     val statusCode: Int = 200,
     val isError: Boolean = false
 ) {

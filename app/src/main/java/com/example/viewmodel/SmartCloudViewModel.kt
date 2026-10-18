@@ -1,10 +1,14 @@
 package com.example.viewmodel
 
+import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -18,19 +22,20 @@ import com.example.model.TransferProgress
 import com.example.repository.SmartCloudRepository
 import com.example.server.LocalFileServer
 import com.example.service.HomeServerForegroundService
+import com.example.webrtc.WebRtcP2pClientManager
 import com.google.firebase.auth.FirebaseUser
 import com.google.firebase.firestore.FirebaseFirestore
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
-import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 class SmartCloudViewModel(
-    private val repository: SmartCloudRepository
+    private val repository: SmartCloudRepository,
+    private val p2pClientManager: WebRtcP2pClientManager? = null
 ) : ViewModel() {
 
     private val _currentUser = MutableStateFlow<FirebaseUser?>(repository.currentUser)
@@ -52,6 +57,14 @@ class SmartCloudViewModel(
     val isServerRunning: StateFlow<Boolean> = HomeServerForegroundService.isRunning
     val localServerNodeInfo: StateFlow<HomeNodeInfo?> = HomeServerForegroundService.currentNodeInfo
     val serverLogs: StateFlow<List<ServerLog>> = HomeServerForegroundService.serverLogs
+    val isMediaProjectionEnabled: StateFlow<Boolean> = HomeServerForegroundService.isMediaProjectionEnabled
+    val webRtcStateText: StateFlow<String> = HomeServerForegroundService.webRtcStateText
+
+    // Global WebRTC P2P Admin Client Flows
+    val isP2pConnected: StateFlow<Boolean> =
+        p2pClientManager?.isP2pConnected ?: MutableStateFlow(false).asStateFlow()
+    val p2pConnectionStatus: StateFlow<String> =
+        p2pClientManager?.p2pConnectionStatus ?: MutableStateFlow("غير متصل").asStateFlow()
 
     // Admin Controller Discovery & Remote File Browser Flows
     private val _discoveredHomeNode = MutableStateFlow<HomeNodeInfo?>(null)
@@ -82,7 +95,8 @@ class SmartCloudViewModel(
     val pendingDeleteItem: StateFlow<RemoteFileItem?> = _pendingDeleteItem.asStateFlow()
 
     private var nodeListenerJob: Job? = null
-    private var lastAutoLoadedNodeIp: String? = null
+    private var p2pStateWatcherJob: Job? = null
+    private var lastAutoLoadedNodeKey: String? = null
 
     init {
         viewModelScope.launch {
@@ -94,9 +108,21 @@ class SmartCloudViewModel(
                         startObservingHomeNode(user.uid)
                     } else {
                         stopObservingHomeNode()
+                        p2pClientManager?.disconnectAll()
                         _selectedMode.value = AppMode.NONE
                     }
                 }
+        }
+
+        // Automatically reload directory over RTCDataChannel as soon as P2P tunnel transitions to OPEN
+        if (p2pClientManager != null) {
+            p2pStateWatcherJob = viewModelScope.launch {
+                p2pClientManager.isP2pConnected.collect { connected ->
+                    if (connected && _selectedMode.value == AppMode.ADMIN_CONTROLLER && _remoteFiles.value.isEmpty()) {
+                        loadRemoteDirectory(_currentRemotePath.value)
+                    }
+                }
+            }
         }
     }
 
@@ -248,6 +274,7 @@ class SmartCloudViewModel(
             if (isServerRunning.value) {
                 stopHomeServerService(context)
             }
+            p2pClientManager?.disconnectAll()
             stopObservingHomeNode()
             repository.signOut(context)
             _selectedMode.value = AppMode.NONE
@@ -258,10 +285,17 @@ class SmartCloudViewModel(
         _selectedMode.value = mode
         _errorBannerMessage.value = null
         _statusBannerMessage.value = null
-        if (mode == AppMode.ADMIN_CONTROLLER) {
+        if (mode == AppMode.ADMIN_CONTROLLER || mode == AppMode.SCREEN_MIRRORING) {
             val node = _discoveredHomeNode.value
-            if (node != null && node.isOnline && node.ipAddress.isNotBlank()) {
-                loadRemoteDirectory(dirPath = _currentRemotePath.value)
+            val uid = _currentUser.value?.uid.orEmpty()
+            if (node != null && node.isOnline) {
+                p2pClientManager?.connectToHomeNodeP2p(
+                    userId = uid.ifBlank { node.userId },
+                    secretToken = node.secretToken
+                )
+                if (mode == AppMode.ADMIN_CONTROLLER) {
+                    loadRemoteDirectory(dirPath = _currentRemotePath.value)
+                }
             }
         }
     }
@@ -272,7 +306,7 @@ class SmartCloudViewModel(
     }
 
     // =========================================================================
-    // HOME NODE SERVER CONTROLS
+    // HOME NODE SERVER CONTROLS (With Optional Notification Permission Support)
     // =========================================================================
 
     fun startHomeServerService(context: Context, port: Int = LocalFileServer.DEFAULT_PORT) {
@@ -280,19 +314,50 @@ class SmartCloudViewModel(
             action = HomeServerForegroundService.ACTION_START_SERVER
             putExtra(HomeServerForegroundService.EXTRA_PORT, port)
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.startForegroundService(intent)
-        } else {
-            context.startService(intent)
+
+        val hasNotifPermission = try {
+            val runtimeGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.POST_NOTIFICATIONS
+                ) == PackageManager.PERMISSION_GRANTED
+            } else {
+                true
+            }
+            runtimeGranted && NotificationManagerCompat.from(context).areNotificationsEnabled()
+        } catch (_: Throwable) {
+            false
         }
-        _statusBannerMessage.value = "تم بدء تشغيل الخادم المنزلي على المنفذ $port"
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && hasNotifPermission) {
+                context.startForegroundService(intent)
+            } else {
+                // Start as background service silently when POST_NOTIFICATIONS is denied/skipped
+                context.startService(intent)
+            }
+        } catch (_: Throwable) {
+            try {
+                context.startService(intent)
+            } catch (_: Throwable) {
+            }
+        }
+
+        _statusBannerMessage.value = if (hasNotifPermission) {
+            "تم بدء تشغيل الخادم المنزلي (WebRTC P2P)"
+        } else {
+            "تم بدء تشغيل الخادم المنزلي في الوضع الصامت (بدون إشعارات)"
+        }
     }
 
     fun stopHomeServerService(context: Context) {
         val intent = Intent(context, HomeServerForegroundService::class.java).apply {
             action = HomeServerForegroundService.ACTION_STOP_SERVER
         }
-        context.startService(intent)
+        try {
+            context.startService(intent)
+        } catch (_: Throwable) {
+        }
         _statusBannerMessage.value = "تم إيقاف الخادم المنزلي"
     }
 
@@ -300,8 +365,21 @@ class SmartCloudViewModel(
         HomeServerForegroundService.clearLogs()
     }
 
+    fun enableMediaProjectionForWebRtc(context: Context, resultCode: Int, dataIntent: Intent) {
+        val intent = Intent(context, HomeServerForegroundService::class.java).apply {
+            action = HomeServerForegroundService.ACTION_ENABLE_MEDIA_PROJECTION
+            putExtra(HomeServerForegroundService.EXTRA_PROJECTION_RESULT_CODE, resultCode)
+            putExtra(HomeServerForegroundService.EXTRA_PROJECTION_DATA_INTENT, dataIntent)
+        }
+        try {
+            context.startService(intent)
+        } catch (_: Throwable) {
+        }
+        _statusBannerMessage.value = "تم تفعيل صلاحية بث الشاشة الكاملة عبر WebRTC P2P (30 FPS)"
+    }
+
     // =========================================================================
-    // ADMIN CONTROLLER REALTIME DISCOVERY & REMOTE ACTIONS
+    // ADMIN CONTROLLER GLOBAL WEBRTC P2P DISCOVERY & REMOTE ACTIONS
     // =========================================================================
 
     private fun startObservingHomeNode(uid: String) {
@@ -313,10 +391,15 @@ class SmartCloudViewModel(
                 }
                 .collect { nodeInfo ->
                     _discoveredHomeNode.value = nodeInfo
-                    if (nodeInfo != null && nodeInfo.isOnline && nodeInfo.ipAddress.isNotBlank()) {
-                        val endpointKey = "${nodeInfo.ipAddress}:${nodeInfo.port}:${nodeInfo.secretToken}"
-                        if (lastAutoLoadedNodeIp != endpointKey) {
-                            lastAutoLoadedNodeIp = endpointKey
+                    if (nodeInfo != null && nodeInfo.isOnline) {
+                        p2pClientManager?.connectToHomeNodeP2p(
+                            userId = uid,
+                            secretToken = nodeInfo.secretToken
+                        )
+                        val endpointKey = "${nodeInfo.effectiveSignalingPath()}:${nodeInfo.secretToken}"
+                        if (lastAutoLoadedNodeKey != endpointKey) {
+                            lastAutoLoadedNodeKey = endpointKey
+                            delay(350L)
                             loadRemoteDirectory(dirPath = _currentRemotePath.value)
                         }
                     }
@@ -332,13 +415,19 @@ class SmartCloudViewModel(
         _currentRemotePath.value = ""
         _parentRemotePath.value = ""
         _rootRemotePath.value = ""
-        lastAutoLoadedNodeIp = null
+        lastAutoLoadedNodeKey = null
     }
 
     fun refreshAdminConnection() {
         val node = _discoveredHomeNode.value ?: return
+        val uid = _currentUser.value?.uid ?: node.userId
+        p2pClientManager?.connectToHomeNodeP2p(
+            userId = uid,
+            secretToken = node.secretToken,
+            forceReconnect = !isP2pConnected.value
+        )
         viewModelScope.launch {
-            repository.pingHomeNodeStatus(node).onSuccess { refreshedNode ->
+            repository.pingHomeNodeStatus(node, p2pClientManager).onSuccess { refreshedNode ->
                 _discoveredHomeNode.value = refreshedNode
             }
             loadRemoteDirectory(_currentRemotePath.value)
@@ -347,7 +436,7 @@ class SmartCloudViewModel(
 
     fun loadRemoteDirectory(dirPath: String = "") {
         val node = _discoveredHomeNode.value
-        if (node == null || !node.isOnline || node.ipAddress.isBlank()) {
+        if (node == null || !node.isOnline) {
             _errorBannerMessage.value = "الخادم المنزلي غير متصل حالياً"
             return
         }
@@ -355,7 +444,7 @@ class SmartCloudViewModel(
         viewModelScope.launch {
             _isLoadingFiles.value = true
             _errorBannerMessage.value = null
-            val result = repository.listRemoteFiles(node, dirPath)
+            val result = repository.listRemoteFiles(node, dirPath, p2pClientManager)
             _isLoadingFiles.value = false
 
             result.onSuccess { listing ->
@@ -366,7 +455,7 @@ class SmartCloudViewModel(
                 }
                 _remoteFiles.value = listing.items
             }.onFailure { error ->
-                _errorBannerMessage.value = "تعذر الاتصال بالخادم المنزلي (${node.ipAddress}:${node.port}): ${error.localizedMessage}"
+                _errorBannerMessage.value = "جاري إتمام ربط نفق WebRTC P2P السحابي (${node.effectiveSignalingPath()}): ${error.localizedMessage}"
             }
         }
     }
@@ -418,9 +507,9 @@ class SmartCloudViewModel(
                 onProgress = { progress -> _transferProgress.value = progress }
             )
             result.onSuccess { savedFile ->
-                _statusBannerMessage.value = "تم حفظ الملف في التنزيلات: ${savedFile.name}"
+                _statusBannerMessage.value = "تم حفظ الملف عبر P2P في التنزيلات: ${savedFile.name}"
             }.onFailure { error ->
-                _errorBannerMessage.value = "فشل سحب الملف: ${error.localizedMessage}"
+                _errorBannerMessage.value = "فشل سحب الملف عبر P2P: ${error.localizedMessage}"
             }
         }
     }
@@ -438,10 +527,10 @@ class SmartCloudViewModel(
                 onProgress = { progress -> _transferProgress.value = progress }
             )
             result.onSuccess { uploadedFileName ->
-                _statusBannerMessage.value = "تم رفع الملف بنجاح: $uploadedFileName"
+                _statusBannerMessage.value = "تم رفع الملف عبر P2P بنجاح: $uploadedFileName"
                 loadRemoteDirectory(targetDir)
             }.onFailure { error ->
-                _errorBannerMessage.value = "فشل رفع الملف: ${error.localizedMessage}"
+                _errorBannerMessage.value = "فشل رفع الملف عبر P2P: ${error.localizedMessage}"
             }
         }
     }
@@ -461,9 +550,9 @@ class SmartCloudViewModel(
 
         viewModelScope.launch {
             _errorBannerMessage.value = null
-            val result = repository.deleteRemoteFile(node, item.path)
+            val result = repository.deleteRemoteFile(node, item.path, p2pClientManager)
             result.onSuccess {
-                _statusBannerMessage.value = "تم حذف ${item.name} من الخادم المنزلي"
+                _statusBannerMessage.value = "تم حذف ${item.name} من الخادم المنزلي عبر P2P"
                 loadRemoteDirectory(_currentRemotePath.value)
             }.onFailure { error ->
                 _errorBannerMessage.value = "تعذر حذف الملف: ${error.localizedMessage}"
@@ -479,7 +568,8 @@ class SmartCloudViewModel(
                 val databaseId = appContext.getString(R.string.firestore_database_id)
                 val firestore = FirebaseFirestore.getInstance(databaseId)
                 val repository = SmartCloudRepository(firestore)
-                return SmartCloudViewModel(repository) as T
+                val p2pManager = WebRtcP2pClientManager.getInstance(appContext)
+                return SmartCloudViewModel(repository, p2pManager) as T
             }
         }
     }

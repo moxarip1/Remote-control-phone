@@ -1,10 +1,13 @@
 package com.example.server
 
+import android.graphics.Bitmap
 import com.example.model.RemoteFileItem
 import com.example.model.ServerLog
 import fi.iki.elonen.NanoHTTPD
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -17,6 +20,7 @@ class LocalFileServer(
     private val secretTokenProvider: () -> String,
     private val statusProvider: () -> Triple<Int, Long, Long>,
     private val rootDirProvider: () -> File,
+    private val screenshotBitmapProvider: () -> Bitmap? = { null },
     private val onLog: (ServerLog) -> Unit
 ) : NanoHTTPD(serverPort) {
 
@@ -29,6 +33,7 @@ class LocalFileServer(
         val expectedToken = secretTokenProvider()
         val providedToken = session.headers["x-auth-token"]
             ?: session.headers["X-Auth-Token"]
+            ?: getQueryParam(session, "token")
             ?: ""
 
         if (expectedToken.isNotBlank() && providedToken != expectedToken) {
@@ -51,6 +56,7 @@ class LocalFileServer(
         return try {
             when {
                 method == Method.GET && uri == "/status" -> handleStatusRequest(clientIp)
+                method == Method.GET && uri == "/screenshot" -> handleScreenshotRequest(session, clientIp)
                 method == Method.GET && uri == "/files" -> handleFilesListRequest(session, clientIp)
                 method == Method.GET && uri == "/download" -> handleDownloadRequest(session, clientIp)
                 method == Method.POST && uri == "/upload" -> handleUploadRequest(session, clientIp)
@@ -117,7 +123,40 @@ class LocalFileServer(
     }
 
     /**
-     * 2. GET /files?path={dirPath}
+     * 2. GET /screenshot
+     * Captures a live Bitmap of the Home Node screen (via PixelCopy / View hierarchy / Telemetry Canvas),
+     * compresses it as JPEG, and returns it with Content-Type: image/jpeg for live HTTP Polling mode.
+     */
+    private fun handleScreenshotRequest(session: IHTTPSession, clientIp: String): Response {
+        val quality = getQueryParam(session, "quality")?.toIntOrNull()?.coerceIn(30, 95) ?: 78
+        val bitmap = screenshotBitmapProvider()
+            ?: return jsonResponse(
+                status = Response.Status.SERVICE_UNAVAILABLE,
+                body = JSONObject()
+                    .put("success", false)
+                    .put("error", "Unable to capture screen Bitmap on Home Node")
+            )
+
+        val baos = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.JPEG, quality, baos)
+        val jpegBytes = baos.toByteArray()
+
+        return newFixedLengthResponse(
+            Response.Status.OK,
+            MIME_JPEG,
+            ByteArrayInputStream(jpegBytes),
+            jpegBytes.size.toLong()
+        ).apply {
+            addHeader("Content-Length", jpegBytes.size.toString())
+            addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            addHeader("Pragma", "no-cache")
+            addHeader("Access-Control-Allow-Origin", "*")
+            addHeader("X-Timestamp", System.currentTimeMillis().toString())
+        }
+    }
+
+    /**
+     * 3. GET /files?path={dirPath}
      * Lists directory contents sorted (folders first, then files alphabetically).
      */
     private fun handleFilesListRequest(session: IHTTPSession, clientIp: String): Response {
@@ -169,7 +208,7 @@ class LocalFileServer(
     }
 
     /**
-     * 3. GET /download?path={filePath}
+     * 4. GET /download?path={filePath}
      * Streams the file using newChunkedResponse with Content-Length and Content-Disposition.
      */
     private fun handleDownloadRequest(session: IHTTPSession, clientIp: String): Response {
@@ -216,7 +255,7 @@ class LocalFileServer(
     }
 
     /**
-     * 4. POST /upload?path={targetDir}&filename={fileName}
+     * 5. POST /upload?path={targetDir}&filename={fileName}
      * Streams incoming InputStream directly to disk in 64KB chunks without loading into RAM.
      */
     private fun handleUploadRequest(session: IHTTPSession, clientIp: String): Response {
@@ -291,7 +330,7 @@ class LocalFileServer(
     }
 
     /**
-     * 5. DELETE /delete?path={targetPath}
+     * 6. DELETE /delete?path={targetPath}
      * Deletes the requested file or folder and returns the operation result.
      */
     private fun handleDeleteRequest(session: IHTTPSession, clientIp: String): Response {
@@ -334,7 +373,7 @@ class LocalFileServer(
     }
 
     /**
-     * 6. GET /stream?path={filePath}
+     * 7. GET /stream?path={filePath}
      * RFC 7233 HTTP Byte-Range video & audio streaming endpoint with 206 Partial Content
      * and FileInputStream.skip(startFrom) for instant seeking without full download.
      */
@@ -493,5 +532,6 @@ class LocalFileServer(
     companion object {
         const val DEFAULT_PORT = 8080
         private const val MIME_JSON = "application/json; charset=utf-8"
+        private const val MIME_JPEG = "image/jpeg"
     }
 }

@@ -391,12 +391,32 @@ class SmartCloudRepository(
     }
 
     // =========================================================================
-    // ADMIN CONTROLLER REMOTE HTTP OPERATIONS (NanoHTTPD Client with x-auth-token)
+    // ADMIN CONTROLLER GLOBAL WEBRTC P2P OPERATIONS (RTCDataChannel + Local Loopback Fallback)
     // =========================================================================
 
-    suspend fun pingHomeNodeStatus(node: HomeNodeInfo): Result<HomeNodeInfo> = withContext(Dispatchers.IO) {
+    private fun resolveLoopbackBaseUrl(node: HomeNodeInfo): String {
+        val host = if (
+            node.ipAddress.isBlank() ||
+            node.ipAddress.equals("WebRTC-P2P-Global", ignoreCase = true)
+        ) {
+            "127.0.0.1"
+        } else {
+            node.ipAddress
+        }
+        return "http://$host:${node.port}"
+    }
+
+    suspend fun pingHomeNodeStatus(
+        node: HomeNodeInfo,
+        p2pManager: com.example.webrtc.WebRtcP2pClientManager? = null
+    ): Result<HomeNodeInfo> = withContext(Dispatchers.IO) {
+        if (p2pManager != null && p2pManager.isP2pConnected.value) {
+            val p2pRes = p2pManager.requestNodeStatusP2p(node)
+            if (p2pRes.isSuccess) return@withContext p2pRes
+        }
+
         try {
-            val url = "${node.baseUrl()}/status"
+            val url = "${resolveLoopbackBaseUrl(node)}/status"
             val request = Request.Builder()
                 .url(url)
                 .header("x-auth-token", node.secretToken)
@@ -413,6 +433,7 @@ class SmartCloudRepository(
                 val json = JSONObject(bodyStr)
                 val updated = node.copy(
                     isOnline = true,
+                    p2pState = "P2P_CONNECTED",
                     batteryLevel = json.optInt("batteryLevel", node.batteryLevel),
                     freeStorageBytes = json.optLong("freeStorageBytes", node.freeStorageBytes),
                     totalStorageBytes = json.optLong("totalStorageBytes", node.totalStorageBytes),
@@ -423,6 +444,9 @@ class SmartCloudRepository(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            if (p2pManager != null) {
+                return@withContext p2pManager.requestNodeStatusP2p(node)
+            }
             Result.failure(e)
         }
     }
@@ -436,11 +460,19 @@ class SmartCloudRepository(
 
     suspend fun listRemoteFiles(
         node: HomeNodeInfo,
-        dirPath: String = ""
+        dirPath: String = "",
+        p2pManager: com.example.webrtc.WebRtcP2pClientManager? = null
     ): Result<RemoteDirectoryListing> = withContext(Dispatchers.IO) {
+        // 1. Primary path: Global WebRTC P2P RTCDataChannel
+        if (p2pManager != null && p2pManager.isP2pConnected.value) {
+            val p2pResult = p2pManager.listRemoteFilesP2p(dirPath)
+            if (p2pResult.isSuccess) return@withContext p2pResult
+        }
+
+        // 2. Fallback / Local Loopback when testing on same device or while ICE is still negotiating
         try {
             val encodedPath = URLEncoder.encode(dirPath, "UTF-8")
-            val url = "${node.baseUrl()}/files?path=$encodedPath"
+            val url = "${resolveLoopbackBaseUrl(node)}/files?path=$encodedPath"
             val request = Request.Builder()
                 .url(url)
                 .header("x-auth-token", node.secretToken)
@@ -486,6 +518,9 @@ class SmartCloudRepository(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            if (p2pManager != null) {
+                return@withContext p2pManager.listRemoteFilesP2p(dirPath)
+            }
             Result.failure(e)
         }
     }
@@ -496,9 +531,20 @@ class SmartCloudRepository(
         fileItem: RemoteFileItem,
         onProgress: (TransferProgress) -> Unit
     ): Result<File> = withContext(Dispatchers.IO) {
+        val p2pManager = com.example.webrtc.WebRtcP2pClientManager.getInstance(context)
+        if (p2pManager.isP2pConnected.value) {
+            val p2pRes = p2pManager.downloadRemoteFileP2p(
+                context = context,
+                fileItem = fileItem,
+                saveToCacheForStreaming = false,
+                onProgress = onProgress
+            )
+            if (p2pRes.isSuccess) return@withContext p2pRes
+        }
+
         try {
             val encodedPath = URLEncoder.encode(fileItem.path, "UTF-8")
-            val url = "${node.baseUrl()}/download?path=$encodedPath"
+            val url = "${resolveLoopbackBaseUrl(node)}/download?path=$encodedPath"
             val request = Request.Builder()
                 .url(url)
                 .header("x-auth-token", node.secretToken)
@@ -569,7 +615,12 @@ class SmartCloudRepository(
             throw e
         } catch (e: Exception) {
             onProgress(TransferProgress(isActive = false))
-            Result.failure(e)
+            p2pManager.downloadRemoteFileP2p(
+                context = context,
+                fileItem = fileItem,
+                saveToCacheForStreaming = false,
+                onProgress = onProgress
+            )
         }
     }
 
@@ -580,6 +631,17 @@ class SmartCloudRepository(
         fileUri: Uri,
         onProgress: (TransferProgress) -> Unit
     ): Result<String> = withContext(Dispatchers.IO) {
+        val p2pManager = com.example.webrtc.WebRtcP2pClientManager.getInstance(context)
+        if (p2pManager.isP2pConnected.value) {
+            val p2pRes = p2pManager.uploadFileToHomeNodeP2p(
+                context = context,
+                targetDirPath = targetDirPath,
+                fileUri = fileUri,
+                onProgress = onProgress
+            )
+            if (p2pRes.isSuccess) return@withContext p2pRes
+        }
+
         try {
             val contentResolver = context.contentResolver
             var displayName = "uploaded_${System.currentTimeMillis()}"
@@ -600,7 +662,7 @@ class SmartCloudRepository(
 
             val encodedDir = URLEncoder.encode(targetDirPath, "UTF-8")
             val encodedName = URLEncoder.encode(displayName, "UTF-8")
-            val url = "${node.baseUrl()}/upload?path=$encodedDir&filename=$encodedName"
+            val url = "${resolveLoopbackBaseUrl(node)}/upload?path=$encodedDir&filename=$encodedName"
 
             val streamingBody = object : RequestBody() {
                 override fun contentType() = "application/octet-stream".toMediaTypeOrNull()
@@ -655,17 +717,28 @@ class SmartCloudRepository(
             throw e
         } catch (e: Exception) {
             onProgress(TransferProgress(isActive = false))
-            Result.failure(e)
+            p2pManager.uploadFileToHomeNodeP2p(
+                context = context,
+                targetDirPath = targetDirPath,
+                fileUri = fileUri,
+                onProgress = onProgress
+            )
         }
     }
 
     suspend fun deleteRemoteFile(
         node: HomeNodeInfo,
-        targetPath: String
+        targetPath: String,
+        p2pManager: com.example.webrtc.WebRtcP2pClientManager? = null
     ): Result<Unit> = withContext(Dispatchers.IO) {
+        if (p2pManager != null && p2pManager.isP2pConnected.value) {
+            val p2pRes = p2pManager.deleteRemoteFileP2p(targetPath)
+            if (p2pRes.isSuccess) return@withContext p2pRes
+        }
+
         try {
             val encodedPath = URLEncoder.encode(targetPath, "UTF-8")
-            val url = "${node.baseUrl()}/delete?path=$encodedPath"
+            val url = "${resolveLoopbackBaseUrl(node)}/delete?path=$encodedPath"
             val request = Request.Builder()
                 .url(url)
                 .header("x-auth-token", node.secretToken)
@@ -684,13 +757,16 @@ class SmartCloudRepository(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            if (p2pManager != null) {
+                return@withContext p2pManager.deleteRemoteFileP2p(targetPath)
+            }
             Result.failure(e)
         }
     }
 
     fun buildStreamUrl(node: HomeNodeInfo, fileItem: RemoteFileItem): String {
         val encodedPath = URLEncoder.encode(fileItem.path, "UTF-8")
-        return "${node.baseUrl()}/stream?path=$encodedPath"
+        return "${resolveLoopbackBaseUrl(node)}/stream?path=$encodedPath"
     }
 
     private companion object {

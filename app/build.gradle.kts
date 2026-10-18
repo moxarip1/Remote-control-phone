@@ -152,11 +152,12 @@ dependencies {
   implementation(libs.kotlinx.coroutines.play.services)
   implementation(libs.okhttp)
 
-  // Local HTTP Server (NanoHTTPD) & Media3 ExoPlayer Streaming
+  // Local HTTP Server (NanoHTTPD), Media3 ExoPlayer Streaming & WebRTC Live Screen Mirroring
   implementation(libs.nanohttpd)
   implementation(libs.androidx.media3.exoplayer)
   implementation(libs.androidx.media3.ui)
   implementation(libs.androidx.media3.common)
+  implementation("org.webrtc:google-webrtc:1.0.32006")
 
   // Unused dependencies commented out for APK size optimization:
   // implementation(libs.accompanist.permissions)

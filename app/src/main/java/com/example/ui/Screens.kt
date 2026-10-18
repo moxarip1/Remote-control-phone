@@ -58,6 +58,7 @@ import androidx.compose.material.icons.filled.PlayCircleFilled
 import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Router
+import androidx.compose.material.icons.filled.ScreenShare
 import androidx.compose.material.icons.filled.SdStorage
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Stop
@@ -137,10 +138,11 @@ import androidx.compose.ui.text.input.VisualTransformation
 data class SystemPermissionsState(
     val hasStorageAccess: Boolean,
     val hasNotificationPermission: Boolean,
-    val isIgnoringBatteryOptimizations: Boolean
+    val isIgnoringBatteryOptimizations: Boolean,
+    val isNotificationSkipped: Boolean = false
 ) {
     val allGranted: Boolean
-        get() = hasStorageAccess && hasNotificationPermission && isIgnoringBatteryOptimizations
+        get() = hasStorageAccess && isIgnoringBatteryOptimizations
 }
 
 // =============================================================================
@@ -737,6 +739,7 @@ fun ModeSelectorScreen(
     isLocalServerRunning: Boolean,
     onRequestStoragePermission: () -> Unit,
     onRequestNotificationPermission: () -> Unit,
+    onSkipNotificationPermission: () -> Unit = {},
     onRequestBatteryOptimizationExemption: () -> Unit,
     onSelectMode: (AppMode) -> Unit,
     onSignOut: () -> Unit
@@ -814,7 +817,7 @@ fun ModeSelectorScreen(
                                 }
                             ) {
                                 Text(
-                                    text = if (permissionsState.allGranted) "مكتملة" else "تحتاج تفعيل",
+                                    text = if (permissionsState.allGranted) "جاهزة للعمل" else "اختيارية / متاحة",
                                     style = MaterialTheme.typography.labelMedium,
                                     color = if (permissionsState.allGranted) Color(0xFF10B981) else Color(0xFFF59E0B),
                                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
@@ -834,11 +837,18 @@ fun ModeSelectorScreen(
 
                         PermissionRowItem(
                             icon = Icons.Default.NotificationsActive,
-                            title = "الإشعارات الدائمة (POST_NOTIFICATIONS)",
-                            subtitle = "لعرض حالة الخادم وعنوان الـ IP في شريط الإشعارات",
+                            title = "الإشعارات الدائمة (اختيارية - POST_NOTIFICATIONS)",
+                            subtitle = if (permissionsState.isNotificationSkipped && !permissionsState.hasNotificationPermission) {
+                                "تم تفعيل الوضع الصامت: سيعمل الخادم في الخلفية بدون إظهار إشعار"
+                            } else {
+                                "اختيارية: لعرض حالة الخادم في شريط الإشعارات (يمكنك تخطيها والعمل بصمت)"
+                            },
                             isGranted = permissionsState.hasNotificationPermission,
+                            isOptionalSkipped = permissionsState.isNotificationSkipped,
                             buttonText = "سماح",
+                            skipButtonText = "تخطي",
                             testTag = "grant_notification_permission_button",
+                            onSkipClick = onSkipNotificationPermission,
                             onClick = onRequestNotificationPermission
                         )
 
@@ -863,11 +873,11 @@ fun ModeSelectorScreen(
 
                 // Card 1: Home Node Server Mode
                 ModeSelectionCard(
-                    title = "Home Node Server Mode",
+                    title = "Home Node Server Mode (Global WebRTC P2P)",
                     arabicTitle = "نمط الخادم المنزلي (الهاتف القديم)",
-                    description = "تحويل هذا الهاتف إلى خادم سحابي منزلي يعمل في الخلفية عبر NanoHTTPD مع مزامنة الـ IP والبطارية والمساحة لحظياً إلى Firebase.",
+                    description = "تحويل هذا الهاتف إلى خادم سحابي منزلي يعمل عبر نفق WebRTC P2P وقناة RTCDataChannel مع مزامنة الإشارات عبر users/{uid}/signaling للوصول من أي شبكة في العالم.",
                     icon = Icons.Default.Dns,
-                    badgeText = if (isLocalServerRunning) "الخادم يعمل الآن في الخلفية" else "جاهز للتشغيل",
+                    badgeText = if (isLocalServerRunning) "الخادم يعمل الآن (WebRTC P2P)" else "جاهز للتشغيل",
                     badgePositive = isLocalServerRunning,
                     accentColor = MaterialTheme.colorScheme.primary,
                     testTag = "select_home_server_mode_card",
@@ -877,12 +887,12 @@ fun ModeSelectorScreen(
                 // Card 2: Admin Controller Mode
                 val isRemoteOnline = discoveredHomeNode?.isOnline == true
                 ModeSelectionCard(
-                    title = "Admin Controller Mode",
+                    title = "Admin Controller Mode (Global WebRTC P2P)",
                     arabicTitle = "نمط وحدة تحكم الآدمن (الهاتف الأساسي)",
-                    description = "تصفح ملفات هاتف المنزل عن بُعد، سحبها، رفع ملفات جديدة، وبث الفيديوهات والصوتيات مباشرة بأعلى سرعة بدون إدخال IP يدوياً.",
+                    description = "الاتصال بهاتف المنزل من أي مكان في العالم (4G/5G أو شبكات واي فاي مختلفة) عبر نفق WebRTC P2P لتصفح الملفات، سحبها، رفعها، ومراقبة الشاشة.",
                     icon = Icons.Default.AdminPanelSettings,
                     badgeText = if (isRemoteOnline) {
-                        "متصل: ${discoveredHomeNode?.deviceName} (${discoveredHomeNode?.ipAddress})"
+                        "متصل عالمياً عبر P2P: ${discoveredHomeNode?.deviceName}"
                     } else {
                         "بانتظار اتصال خادم المنزل"
                     },
@@ -902,8 +912,11 @@ private fun PermissionRowItem(
     title: String,
     subtitle: String,
     isGranted: Boolean,
+    isOptionalSkipped: Boolean = false,
     buttonText: String,
+    skipButtonText: String? = null,
     testTag: String,
+    onSkipClick: (() -> Unit)? = null,
     onClick: () -> Unit
 ) {
     Row(
@@ -913,7 +926,11 @@ private fun PermissionRowItem(
         Icon(
             imageVector = icon,
             contentDescription = title,
-            tint = if (isGranted) Color(0xFF10B981) else MaterialTheme.colorScheme.primary,
+            tint = when {
+                isGranted -> Color(0xFF10B981)
+                isOptionalSkipped -> Color(0xFF38BDF8)
+                else -> MaterialTheme.colorScheme.primary
+            },
             modifier = Modifier.size(26.dp)
         )
         Spacer(modifier = Modifier.width(12.dp))
@@ -930,19 +947,50 @@ private fun PermissionRowItem(
             )
         }
         Spacer(modifier = Modifier.width(8.dp))
-        if (isGranted) {
-            Icon(
-                imageVector = Icons.Default.CheckCircle,
-                contentDescription = "ممنوحة",
-                tint = Color(0xFF10B981),
-                modifier = Modifier.size(24.dp)
-            )
-        } else {
-            FilledTonalButton(
-                onClick = onClick,
-                modifier = Modifier.testTag(testTag)
-            ) {
-                Text(buttonText)
+        when {
+            isGranted -> {
+                Icon(
+                    imageVector = Icons.Default.CheckCircle,
+                    contentDescription = "ممنوحة",
+                    tint = Color(0xFF10B981),
+                    modifier = Modifier.size(24.dp)
+                )
+            }
+            isOptionalSkipped -> {
+                Surface(
+                    shape = RoundedCornerShape(50),
+                    color = Color(0xFF38BDF8).copy(alpha = 0.16f),
+                    modifier = Modifier.clickable { onClick() }
+                ) {
+                    Text(
+                        text = "وضع صامت",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color(0xFF38BDF8),
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                    )
+                }
+            }
+            else -> {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (skipButtonText != null && onSkipClick != null) {
+                        TextButton(
+                            onClick = onSkipClick,
+                            modifier = Modifier.testTag("${testTag}_skip")
+                        ) {
+                            Text(skipButtonText)
+                        }
+                    }
+                    FilledTonalButton(
+                        onClick = onClick,
+                        modifier = Modifier.testTag(testTag)
+                    ) {
+                        Text(buttonText)
+                    }
+                }
             }
         }
     }
@@ -1046,8 +1094,11 @@ fun HomeNodeServerScreen(
     nodeInfo: HomeNodeInfo?,
     logs: List<ServerLog>,
     statusMessage: String?,
+    isMediaProjectionEnabled: Boolean = false,
+    webRtcStateText: String = "",
     onStartServer: () -> Unit,
     onStopServer: () -> Unit,
+    onRequestMediaProjection: () -> Unit = {},
     onClearLogs: () -> Unit,
     onBackToModeSelector: () -> Unit
 ) {
@@ -1172,11 +1223,11 @@ fun HomeNodeServerScreen(
                         ) {
                             TelemetryStatChip(
                                 icon = Icons.Default.Router,
-                                label = "عنوان الشبكة IP:Port",
+                                label = "مسار الإشارات العالمي (P2P)",
                                 value = if (nodeInfo != null && isRunning) {
-                                    "${nodeInfo.ipAddress}:${nodeInfo.port}"
+                                    "متاح عالمياً عبر P2P"
                                 } else {
-                                    "--:--"
+                                    "غير نشط"
                                 },
                                 modifier = Modifier.weight(1f)
                             )
@@ -1231,6 +1282,42 @@ fun HomeNodeServerScreen(
                                     fontFamily = FontFamily.Monospace,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
+                            }
+
+                            // Screen Mirroring & WebRTC MediaProjection Quick Control
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "بث الشاشة المزدوج (/screenshot + WebRTC):",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    Text(
+                                        text = if (isMediaProjectionEnabled) {
+                                            "صلاحية MediaProjection مفعّلة • $webRtcStateText"
+                                        } else {
+                                            "PixelCopy نشط تلقائياً • $webRtcStateText"
+                                        },
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                FilledTonalButton(
+                                    onClick = onRequestMediaProjection,
+                                    modifier = Modifier.testTag("enable_media_projection_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.ScreenShare,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(if (isMediaProjectionEnabled) "مفعّل (30FPS)" else "بث الشاشة الكاملة")
+                                }
                             }
                         }
 
@@ -1407,6 +1494,8 @@ private fun ConsoleLogItemRow(log: ServerLog) {
 @Composable
 fun AdminControllerScreen(
     discoveredNode: HomeNodeInfo?,
+    isP2pConnected: Boolean = false,
+    p2pConnectionStatus: String = "",
     remoteFiles: List<RemoteFileItem>,
     currentPath: String,
     rootPath: String,
@@ -1430,6 +1519,7 @@ fun AdminControllerScreen(
     onUploadFileSelected: (android.net.Uri) -> Unit,
     onCloseStreamPlayer: () -> Unit,
     buildStreamUrl: (RemoteFileItem) -> String?,
+    onOpenScreenMirroring: () -> Unit = {},
     onDismissBanners: () -> Unit
 ) {
     // System BackHandler navigates up to parent folder first, then exits to Mode Selector
@@ -1457,15 +1547,18 @@ fun AdminControllerScreen(
                     title = {
                         Column {
                             Text(
-                                text = "لوحة تحكم الآدمن (Admin Controller)",
+                                text = "لوحة تحكم الآدمن (Global WebRTC P2P)",
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = if (discoveredNode?.isOnline == true) {
-                                    "متصل تلقائياً بـ ${discoveredNode.deviceName}"
-                                } else {
-                                    "بانتظار اتصال هاتف المنزل..."
+                                text = when {
+                                    isP2pConnected && discoveredNode?.isOnline == true ->
+                                        "متصل عالمياً عبر P2P بـ ${discoveredNode.deviceName}"
+                                    discoveredNode?.isOnline == true ->
+                                        "متصل بـ ${discoveredNode.deviceName} • $p2pConnectionStatus"
+                                    else ->
+                                        "بانتظار اتصال هاتف المنزل..."
                                 },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = if (discoveredNode?.isOnline == true) {
@@ -1492,6 +1585,18 @@ fun AdminControllerScreen(
                         }
                     },
                     actions = {
+                        IconButton(
+                            onClick = onOpenScreenMirroring,
+                            modifier = Modifier
+                                .size(48.dp)
+                                .testTag("open_screen_mirroring_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.ScreenShare,
+                                contentDescription = "بث شاشة الهاتف المزدوجة (Screen Mirroring)",
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
                         IconButton(
                             onClick = onRefreshConnection,
                             modifier = Modifier
@@ -1529,8 +1634,11 @@ fun AdminControllerScreen(
                     .padding(horizontal = 16.dp, vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                // 1. Automatic Realtime Home Node Discovery Card
-                HomeNodeDiscoveryHeaderCard(node = discoveredNode)
+                // 1. Automatic Realtime Home Node Discovery Card + Screen Mirroring Button
+                HomeNodeDiscoveryHeaderCard(
+                    node = discoveredNode,
+                    onOpenScreenMirroring = onOpenScreenMirroring
+                )
 
                 // 2. Active Transfer Progress Indicator (Download / Upload)
                 AnimatedVisibility(visible = transferProgress.isActive) {
@@ -1769,7 +1877,10 @@ fun AdminControllerScreen(
 }
 
 @Composable
-private fun HomeNodeDiscoveryHeaderCard(node: HomeNodeInfo?) {
+private fun HomeNodeDiscoveryHeaderCard(
+    node: HomeNodeInfo?,
+    onOpenScreenMirroring: () -> Unit = {}
+) {
     val isOnline = node?.isOnline == true
     ElevatedCard(
         shape = RoundedCornerShape(20.dp),
@@ -1812,8 +1923,8 @@ private fun HomeNodeDiscoveryHeaderCard(node: HomeNodeInfo?) {
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            text = if (isOnline && node != null) {
-                                "متصل تلقائياً • ${node.ipAddress}:${node.port}"
+                            text = if (isOnline) {
+                                "متصل عالمياً عبر P2P • ${node.effectiveSignalingPath()}"
                             } else {
                                 "غير متصل حالياً (Offline)"
                             },
@@ -1875,6 +1986,25 @@ private fun HomeNodeDiscoveryHeaderCard(node: HomeNodeInfo?) {
                             .clip(RoundedCornerShape(50))
                     )
                 }
+            }
+
+            FilledTonalButton(
+                onClick = onOpenScreenMirroring,
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("open_screen_mirroring_card_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.ScreenShare,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "بث شاشة الهاتف المزدوجة (HTTP /screenshot + WebRTC Live)",
+                    fontWeight = FontWeight.Bold
+                )
             }
         }
     }
