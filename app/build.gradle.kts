@@ -21,6 +21,9 @@ android {
     versionName = "2.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    ndk {
+      abiFilters += listOf("arm64-v8a")
+    }
   }
 
   // Do not remove or modify these signingConfigs. They are necessary for building, installing,
@@ -63,6 +66,11 @@ android {
   buildFeatures {
     compose = true
     buildConfig = true
+  }
+  packaging {
+    jniLibs {
+      useLegacyPackaging = true
+    }
   }
   testOptions { unitTests { isIncludeAndroidResources = true } }
   dependenciesInfo {
@@ -107,17 +115,27 @@ val syncDebugApkToRootFolder by tasks.registering {
       ?: fallbackApk.takeIf { it.exists() && it.length() > 0L }
 
     if (sourceApk != null) {
+      val now = System.currentTimeMillis()
       val debugApkDest = File(targetDebugDir, "debug.apk")
       val namedApkDest = File(targetDebugDir, "SmartHomeCloud-debug.apk")
+
+      // Replace any temporary files with plain text so VFS delete_file can remove them cleanly
+      File(targetDebugDir, "debug_old.apk").let { if (it.exists()) it.writeText("cleanup\n") }
+      File(targetDebugDir, "temp_old2.apk").let { if (it.exists()) it.writeText("cleanup\n") }
+      File(targetDebugDir, "staged_debug.apk").let { if (it.exists()) it.delete() }
+      File(targetDebugDir, "staged_SmartHomeCloud.apk").let { if (it.exists()) it.delete() }
+
       sourceApk.copyTo(debugApkDest, overwrite = true)
       sourceApk.copyTo(namedApkDest, overwrite = true)
+      debugApkDest.setLastModified(now)
+      namedApkDest.setLastModified(now)
+
       File(targetDebugDir, "BUILD_INFO.txt").writeText(
         "Application: Smart Home Cloud v2.0 (Single APK)\n" +
           "Version: 2.0 (versionCode = 2)\n" +
-          "Updated At (Epoch ms): ${System.currentTimeMillis()}\n" +
-          "BuildDir Path: ${buildDirFile.absolutePath}\n" +
-          "Found APKs in BuildDir: ${builtApksInBuildDir.joinToString { "${it.absolutePath} (${it.length()}B)" }}\n" +
+          "Updated At (Epoch ms): $now\n" +
           "Selected Source APK: ${sourceApk.absolutePath} (${sourceApk.length()} bytes)\n" +
+          "Output debug/debug.apk Size: ${debugApkDest.length()} bytes\n" +
           "Included Updates:\n" +
           "- Email/Password Login, Account Creation & Password Reset + Google Sign-In\n" +
           "- Global WebRTC P2P Architecture (RTCDataChannel + 30 FPS Live Stream via users/{uid}/signaling)\n" +
@@ -153,7 +171,7 @@ dependencies {
   implementation(platform(libs.firebase.bom))
   implementation(libs.androidx.activity.compose)
   implementation(libs.androidx.compose.material.icons.core)
-  implementation(libs.androidx.compose.material.icons.extended)
+  // implementation(libs.androidx.compose.material.icons.extended)
   implementation(libs.androidx.compose.material3)
   implementation(libs.androidx.compose.ui)
   implementation(libs.androidx.compose.ui.graphics)
@@ -217,6 +235,6 @@ dependencies {
   androidTestImplementation(libs.androidx.espresso.core)
   androidTestImplementation(libs.androidx.junit)
   androidTestImplementation(libs.androidx.runner)
-  debugImplementation(libs.androidx.compose.ui.test.manifest)
-  debugImplementation(libs.androidx.compose.ui.tooling)
+  // debugImplementation(libs.androidx.compose.ui.test.manifest)
+  // debugImplementation(libs.androidx.compose.ui.tooling)
 }
