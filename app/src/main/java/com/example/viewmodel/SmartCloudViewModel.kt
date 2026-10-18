@@ -285,18 +285,27 @@ class SmartCloudViewModel(
         _selectedMode.value = mode
         _errorBannerMessage.value = null
         _statusBannerMessage.value = null
-        if (mode == AppMode.ADMIN_CONTROLLER || mode == AppMode.SCREEN_MIRRORING) {
-            val node = _discoveredHomeNode.value
-            val uid = _currentUser.value?.uid.orEmpty()
-            if (node != null && node.isOnline) {
-                p2pClientManager?.connectToHomeNodeP2p(
-                    userId = uid.ifBlank { node.userId },
-                    secretToken = node.secretToken
-                )
-                if (mode == AppMode.ADMIN_CONTROLLER) {
-                    loadRemoteDirectory(dirPath = _currentRemotePath.value)
+        when (mode) {
+            AppMode.HOME_NODE_SERVER -> {
+                // Ensure Admin P2P client is idle on this device so it never collides with the local Home Node Server
+                p2pClientManager?.disconnectAll()
+            }
+            AppMode.ADMIN_CONTROLLER, AppMode.SCREEN_MIRRORING -> {
+                val node = _discoveredHomeNode.value
+                val uid = _currentUser.value?.uid.orEmpty()
+                if (node != null && node.isOnline) {
+                    if (!isServerRunning.value) {
+                        p2pClientManager?.connectToHomeNodeP2p(
+                            userId = uid.ifBlank { node.userId },
+                            secretToken = node.secretToken
+                        )
+                    }
+                    if (mode == AppMode.ADMIN_CONTROLLER) {
+                        loadRemoteDirectory(dirPath = _currentRemotePath.value)
+                    }
                 }
             }
+            AppMode.NONE -> {}
         }
     }
 
@@ -310,7 +319,11 @@ class SmartCloudViewModel(
     // =========================================================================
 
     fun startHomeServerService(context: Context, port: Int = LocalFileServer.DEFAULT_PORT) {
-        val intent = Intent(context, HomeServerForegroundService::class.java).apply {
+        // Ensure any local Admin P2P client is disconnected before starting the Home Node Server
+        p2pClientManager?.disconnectAll()
+
+        val appContext = context.applicationContext
+        val intent = Intent(appContext, HomeServerForegroundService::class.java).apply {
             action = HomeServerForegroundService.ACTION_START_SERVER
             putExtra(HomeServerForegroundService.EXTRA_PORT, port)
         }
@@ -318,28 +331,30 @@ class SmartCloudViewModel(
         val hasNotifPermission = try {
             val runtimeGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 ContextCompat.checkSelfPermission(
-                    context,
+                    appContext,
                     Manifest.permission.POST_NOTIFICATIONS
                 ) == PackageManager.PERMISSION_GRANTED
             } else {
                 true
             }
-            runtimeGranted && NotificationManagerCompat.from(context).areNotificationsEnabled()
+            runtimeGranted && NotificationManagerCompat.from(appContext).areNotificationsEnabled()
         } catch (_: Throwable) {
             false
         }
 
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && hasNotifPermission) {
-                context.startForegroundService(intent)
-            } else {
-                // Start as background service silently when POST_NOTIFICATIONS is denied/skipped
-                context.startService(intent)
-            }
+            // Always prefer startService() when launched from foreground UI so the OS never arms
+            // a fatal ForegroundServiceDidNotStartInTimeException timer if notifications are denied/restricted.
+            // HomeServerForegroundService still promotes itself via startForeground() inside onStartCommand.
+            appContext.startService(intent)
         } catch (_: Throwable) {
             try {
-                context.startService(intent)
-            } catch (_: Throwable) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && hasNotifPermission) {
+                    appContext.startForegroundService(intent)
+                }
+            } catch (e: Throwable) {
+                _errorBannerMessage.value = "تعذر تشغيل الخادم: ${e.localizedMessage}"
+                return
             }
         }
 
@@ -351,12 +366,17 @@ class SmartCloudViewModel(
     }
 
     fun stopHomeServerService(context: Context) {
-        val intent = Intent(context, HomeServerForegroundService::class.java).apply {
+        val appContext = context.applicationContext
+        val intent = Intent(appContext, HomeServerForegroundService::class.java).apply {
             action = HomeServerForegroundService.ACTION_STOP_SERVER
         }
         try {
-            context.startService(intent)
+            appContext.startService(intent)
         } catch (_: Throwable) {
+            try {
+                appContext.stopService(Intent(appContext, HomeServerForegroundService::class.java))
+            } catch (_: Throwable) {
+            }
         }
         _statusBannerMessage.value = "تم إيقاف الخادم المنزلي"
     }
@@ -366,13 +386,14 @@ class SmartCloudViewModel(
     }
 
     fun enableMediaProjectionForWebRtc(context: Context, resultCode: Int, dataIntent: Intent) {
-        val intent = Intent(context, HomeServerForegroundService::class.java).apply {
+        val appContext = context.applicationContext
+        val intent = Intent(appContext, HomeServerForegroundService::class.java).apply {
             action = HomeServerForegroundService.ACTION_ENABLE_MEDIA_PROJECTION
             putExtra(HomeServerForegroundService.EXTRA_PROJECTION_RESULT_CODE, resultCode)
             putExtra(HomeServerForegroundService.EXTRA_PROJECTION_DATA_INTENT, dataIntent)
         }
         try {
-            context.startService(intent)
+            appContext.startService(intent)
         } catch (_: Throwable) {
         }
         _statusBannerMessage.value = "تم تفعيل صلاحية بث الشاشة الكاملة عبر WebRTC P2P (30 FPS)"
@@ -391,13 +412,17 @@ class SmartCloudViewModel(
                 }
                 .collect { nodeInfo ->
                     _discoveredHomeNode.value = nodeInfo
-                    if (nodeInfo != null && nodeInfo.isOnline) {
-                        p2pClientManager?.connectToHomeNodeP2p(
-                            userId = uid,
-                            secretToken = nodeInfo.secretToken
-                        )
+                    val currentMode = _selectedMode.value
+                    val isAdminMode = currentMode == AppMode.ADMIN_CONTROLLER || currentMode == AppMode.SCREEN_MIRRORING
+                    if (nodeInfo != null && nodeInfo.isOnline && isAdminMode) {
+                        if (!isServerRunning.value) {
+                            p2pClientManager?.connectToHomeNodeP2p(
+                                userId = uid,
+                                secretToken = nodeInfo.secretToken
+                            )
+                        }
                         val endpointKey = "${nodeInfo.effectiveSignalingPath()}:${nodeInfo.secretToken}"
-                        if (lastAutoLoadedNodeKey != endpointKey) {
+                        if (lastAutoLoadedNodeKey != endpointKey && currentMode == AppMode.ADMIN_CONTROLLER) {
                             lastAutoLoadedNodeKey = endpointKey
                             delay(350L)
                             loadRemoteDirectory(dirPath = _currentRemotePath.value)

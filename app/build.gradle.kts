@@ -22,7 +22,7 @@ android {
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     ndk {
-      abiFilters += listOf("arm64-v8a")
+      abiFilters += listOf("arm64-v8a", "armeabi-v7a")
     }
   }
 
@@ -119,7 +119,7 @@ val syncDebugApkToRootFolder by tasks.registering {
       val debugApkDest = File(targetDebugDir, "debug.apk")
       val namedApkDest = File(targetDebugDir, "SmartHomeCloud-debug.apk")
 
-      // Replace any temporary files with plain text so VFS delete_file can remove them cleanly
+      // Replace any old temporary files with plain text so VFS delete_file can remove them cleanly
       File(targetDebugDir, "debug_old.apk").let { if (it.exists()) it.writeText("cleanup\n") }
       File(targetDebugDir, "temp_old2.apk").let { if (it.exists()) it.writeText("cleanup\n") }
       File(targetDebugDir, "staged_debug.apk").let { if (it.exists()) it.delete() }
@@ -137,8 +137,9 @@ val syncDebugApkToRootFolder by tasks.registering {
           "Selected Source APK: ${sourceApk.absolutePath} (${sourceApk.length()} bytes)\n" +
           "Output debug/debug.apk Size: ${debugApkDest.length()} bytes\n" +
           "Included Updates:\n" +
+          "- Fixed Home Node Server startup crash (non-blocking boot, isolated P2P signaling, monochrome vector notification icon, 32/64-bit ARM native WebRTC support)\n" +
           "- Email/Password Login, Account Creation & Password Reset + Google Sign-In\n" +
-          "- Global WebRTC P2P Architecture (RTCDataChannel + 30 FPS Live Stream via users/{uid}/signaling)\n" +
+          "- Global WebRTC P2P Architecture (RTCDataChannel + Live Stream via users/{uid}/signaling)\n" +
           "- Dual Screen Mirroring (/screenshot Polling + WebRTC SurfaceViewRenderer)\n" +
           "- Optional & Skippable POST_NOTIFICATIONS Permission (Silent Background Server Mode without crash)\n"
       )

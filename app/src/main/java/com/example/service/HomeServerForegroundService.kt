@@ -46,6 +46,7 @@ import com.example.model.RemoteFileItem
 import com.example.model.ServerLog
 import com.example.repository.SmartCloudRepository
 import com.example.server.LocalFileServer
+import com.example.webrtc.WebRtcP2pClientManager
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.database.DataSnapshot
 import com.google.firebase.database.DatabaseError
@@ -69,9 +70,6 @@ import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 import org.webrtc.DataChannel
-import org.webrtc.DefaultVideoDecoderFactory
-import org.webrtc.DefaultVideoEncoderFactory
-import org.webrtc.EglBase
 import org.webrtc.IceCandidate
 import org.webrtc.MediaConstraints
 import org.webrtc.MediaStream
@@ -106,6 +104,7 @@ class HomeServerForegroundService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var serverBootJob: Job? = null
     private var heartbeatJob: Job? = null
     private var syntheticFramePumpJob: Job? = null
 
@@ -115,12 +114,12 @@ class HomeServerForegroundService : Service() {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     private var localFileServer: LocalFileServer? = null
-    private lateinit var repository: SmartCloudRepository
+    private var repository: SmartCloudRepository? = null
     private var sessionSecretToken: String = UUID.randomUUID().toString()
     private var activePort: Int = LocalFileServer.DEFAULT_PORT
 
-    // WebRTC P2P Engine Components (Global RTCDataChannel + 30 FPS Video Stream + Firebase Signaling)
-    private var eglBase: EglBase? = null
+    // WebRTC P2P Engine Components (Shared Factory + Global RTCDataChannel + Video Stream)
+    private val webRtcLock = Any()
     private var peerConnectionFactory: PeerConnectionFactory? = null
     private var peerConnection: PeerConnection? = null
     private var activeDataChannel: DataChannel? = null
@@ -129,6 +128,9 @@ class HomeServerForegroundService : Service() {
     private var screenCapturer: VideoCapturer? = null
     private var surfaceTextureHelper: SurfaceTextureHelper? = null
 
+    @Volatile
+    private var isPeerSessionActive: Boolean = false
+
     private var rtdbSignalingRef: DatabaseReference? = null
     private var rtdbOfferListener: ValueEventListener? = null
     private var firestoreSignalingRegistration: ListenerRegistration? = null
@@ -136,9 +138,13 @@ class HomeServerForegroundService : Service() {
 
     private val addedRemoteCandidateKeys = mutableSetOf<String>()
     private val localServerCandidatesArray = JSONArray()
-    private var lastHandledOfferSdp: String? = null
-    private var lastHandledAnswerSdp: String? = null
+    private var lastHandledOfferKey: String? = null
     private var currentP2pSessionId: String = ""
+
+    // Rate-limited screenshot cache to avoid hammering the UI thread or allocating excessive bitmaps
+    private val screenshotCacheLock = Any()
+    private var cachedScreenshotBitmap: Bitmap? = null
+    private var cachedScreenshotTimeMs: Long = 0L
 
     private data class IncomingUploadSession(
         val uploadId: String,
@@ -151,7 +157,10 @@ class HomeServerForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        repository = SmartCloudRepository(applicationContext)
+        try {
+            repository = SmartCloudRepository(applicationContext)
+        } catch (_: Throwable) {
+        }
         createNotificationChannel()
     }
 
@@ -168,18 +177,34 @@ class HomeServerForegroundService : Service() {
                 stopServerAndSelf()
                 return START_NOT_STICKY
             }
+
             ACTION_ENABLE_MEDIA_PROJECTION -> {
                 val resultCode = intent.getIntExtra(EXTRA_PROJECTION_RESULT_CODE, Activity.RESULT_CANCELED)
                 @Suppress("DEPRECATION")
-                val dataIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    intent.getParcelableExtra(EXTRA_PROJECTION_DATA_INTENT, Intent::class.java)
-                } else {
-                    intent.getParcelableExtra(EXTRA_PROJECTION_DATA_INTENT)
+                val dataIntent = try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(EXTRA_PROJECTION_DATA_INTENT, Intent::class.java)
+                    } else {
+                        intent.getParcelableExtra(EXTRA_PROJECTION_DATA_INTENT)
+                    }
+                } catch (_: Throwable) {
+                    null
                 }
-                if (dataIntent != null) {
+                if (dataIntent != null && resultCode == Activity.RESULT_OK) {
                     mediaProjectionPermissionData = dataIntent
                     mediaProjectionResultCode = resultCode
                     _isMediaProjectionEnabled.value = true
+
+                    val uid = try {
+                        FirebaseAuth.getInstance().currentUser?.uid.orEmpty()
+                    } catch (_: Throwable) {
+                        ""
+                    }
+                    val signalingPath = if (uid.isNotBlank()) "users/$uid/signaling" else "users/{uid}/signaling"
+                    // Mandatory on Android 14+ (API 34+): promote service with FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                    // before starting ScreenCapturerAndroid.
+                    tryPromoteToForeground(signalingPath, includeMediaProjection = true)
+
                     appendLog(
                         ServerLog(
                             method = "WEBRTC",
@@ -187,13 +212,26 @@ class HomeServerForegroundService : Service() {
                             message = "تم تفعيل صلاحية بث الشاشة الكاملة عبر WebRTC P2P (30 FPS)"
                         )
                     )
-                    restartWebRtcCapturerIfNeeded()
+                    serviceScope.launch {
+                        restartWebRtcCapturerIfNeeded()
+                    }
                 }
             }
+
             else -> {
+                val requestedPort = intent?.getIntExtra(EXTRA_PORT, LocalFileServer.DEFAULT_PORT)
+                    ?: LocalFileServer.DEFAULT_PORT
+                val uid = try {
+                    FirebaseAuth.getInstance().currentUser?.uid.orEmpty()
+                } catch (_: Throwable) {
+                    ""
+                }
+                val signalingPath = if (uid.isNotBlank()) "users/$uid/signaling" else "users/{uid}/signaling"
+
+                // Always promote safely on start command if notification permission is granted
+                tryPromoteToForeground(signalingPath, includeMediaProjection = _isMediaProjectionEnabled.value)
+
                 if (!_isRunning.value) {
-                    val requestedPort = intent?.getIntExtra(EXTRA_PORT, LocalFileServer.DEFAULT_PORT)
-                        ?: LocalFileServer.DEFAULT_PORT
                     startHomeNodeServer(requestedPort)
                 }
             }
@@ -201,42 +239,8 @@ class HomeServerForegroundService : Service() {
         return START_STICKY
     }
 
-    private fun startHomeNodeServer(port: Int) {
-        activePort = port
-        sessionSecretToken = UUID.randomUUID().toString()
-
-        acquireHardwareLocks()
-        ensureSampleCloudFilesIfNeeded()
-
-        val uid = FirebaseAuth.getInstance().currentUser?.uid.orEmpty()
-        val signalingPath = if (uid.isNotBlank()) "users/$uid/signaling" else "users/{uid}/signaling"
-
-        // Safely attempt to show foreground notification only if permission is granted,
-        // and catch any SecurityException / ForegroundServiceStartNotAllowedException so the service
-        // continues running silently if notifications are denied by the user.
-        if (hasNotificationPermission()) {
-            try {
-                val notification = buildForegroundNotification(signalingPath)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    val fgType = if (_isMediaProjectionEnabled.value) {
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-                    } else {
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-                    }
-                    startForeground(NOTIFICATION_ID, notification, fgType)
-                } else {
-                    startForeground(NOTIFICATION_ID, notification)
-                }
-            } catch (e: Throwable) {
-                appendLog(
-                    ServerLog(
-                        method = "SYSTEM",
-                        endpoint = "/notification",
-                        message = "يعمل الخادم المنزلي في الوضع الصامت (تعذر عرض الإشعار: ${e.javaClass.simpleName})"
-                    )
-                )
-            }
-        } else {
+    private fun tryPromoteToForeground(signalingPath: String, includeMediaProjection: Boolean) {
+        if (!hasNotificationPermission()) {
             appendLog(
                 ServerLog(
                     method = "SYSTEM",
@@ -244,65 +248,156 @@ class HomeServerForegroundService : Service() {
                     message = "يعمل الخادم المنزلي في الوضع الصامت (صلاحية الإشعارات غير مفعّلة)"
                 )
             )
+            return
         }
 
         try {
-            // Keep LocalFileServer running as local loopback helper while primary transport is Global WebRTC P2P
-            localFileServer?.stop()
-            localFileServer = LocalFileServer(
-                serverPort = activePort,
-                secretTokenProvider = { sessionSecretToken },
-                statusProvider = { readHardwareStatus() },
-                rootDirProvider = { resolveStorageRootDir() },
-                screenshotBitmapProvider = { captureHomeNodeScreenBitmap() },
-                onLog = { logItem -> appendLog(logItem) }
-            ).also { server ->
-                server.start(NanoHttpdSocketTimeoutMs, false)
+            val notification = buildForegroundNotification(signalingPath)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val fgType = if (includeMediaProjection && _isMediaProjectionEnabled.value) {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                } else {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                }
+                startForeground(NOTIFICATION_ID, notification, fgType)
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
             }
-
-            _isRunning.value = true
-            _webRtcStateText.value = "بانتظار ربط الآدمن عبر $signalingPath"
+        } catch (e: Throwable) {
+            // Fall back to basic DATA_SYNC foreground promotion if mediaProjection type was rejected
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && includeMediaProjection) {
+                try {
+                    val notification = buildForegroundNotification(signalingPath)
+                    startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                    return
+                } catch (_: Throwable) {
+                }
+            }
             appendLog(
                 ServerLog(
-                    method = "WEBRTC-P2P",
-                    endpoint = signalingPath,
-                    message = "تم تشغيل عقدة المنزل الذكية (WebRTC P2P + RTCDataChannel) عبر مسار الإشارات السحابي"
+                    method = "SYSTEM",
+                    endpoint = "/notification",
+                    message = "يعمل الخادم المنزلي في الوضع الصامت (تعذر عرض الإشعار: ${e.javaClass.simpleName})"
                 )
             )
+        }
+    }
 
-            registerNetworkCallback()
-            startTelemetryHeartbeatLoop()
-            initializeWebRtcServerSignaling()
-        } catch (e: Exception) {
-            appendLog(
-                ServerLog(
-                    method = "ERROR",
-                    endpoint = "/boot",
-                    message = "تعذر تشغيل محرك الخادم المنزلي: ${e.localizedMessage}",
-                    statusCode = 500,
-                    isError = true
+    private fun startHomeNodeServer(port: Int) {
+        activePort = port
+        sessionSecretToken = UUID.randomUUID().toString()
+        _isRunning.value = true
+
+        val uid = try {
+            FirebaseAuth.getInstance().currentUser?.uid.orEmpty()
+        } catch (_: Throwable) {
+            ""
+        }
+        val signalingPath = if (uid.isNotBlank()) "users/$uid/signaling" else "users/{uid}/signaling"
+        _webRtcStateText.value = "بانتظار ربط الآدمن عبر $signalingPath"
+
+        // Boot all hardware locks, file preparation, local HTTP server, and WebRTC signaling
+        // asynchronously on Dispatchers.IO so the Main UI Thread never blocks or crashes.
+        serverBootJob?.cancel()
+        serverBootJob = serviceScope.launch {
+            try {
+                acquireHardwareLocks()
+                ensureSampleCloudFilesIfNeeded()
+                startLocalHttpServerWithFallback(port)
+
+                appendLog(
+                    ServerLog(
+                        method = "WEBRTC-P2P",
+                        endpoint = signalingPath,
+                        message = "تم تشغيل عقدة المنزل الذكية (WebRTC P2P + RTCDataChannel) عبر مسار الإشارات السحابي"
+                    )
                 )
-            )
-            stopServerAndSelf()
+
+                registerNetworkCallback()
+                startTelemetryHeartbeatLoop()
+                initializeWebRtcServerSignaling()
+            } catch (t: Throwable) {
+                appendLog(
+                    ServerLog(
+                        method = "WARN",
+                        endpoint = "/boot",
+                        message = "ملاحظة أثناء بدء الخادم المنزلي (يستمر الخادم بالعمل): ${t.localizedMessage ?: t.javaClass.simpleName}",
+                        isError = false
+                    )
+                )
+            }
+        }
+    }
+
+    private fun startLocalHttpServerWithFallback(preferredPort: Int) {
+        try {
+            localFileServer?.stop()
+        } catch (_: Throwable) {
+        }
+        localFileServer = null
+
+        val candidatePorts = listOf(preferredPort, 8081, 8082, 8088, 8888).distinct()
+        for (candidatePort in candidatePorts) {
+            try {
+                val server = LocalFileServer(
+                    serverPort = candidatePort,
+                    secretTokenProvider = { sessionSecretToken },
+                    statusProvider = { readHardwareStatus() },
+                    rootDirProvider = { resolveStorageRootDir() },
+                    screenshotBitmapProvider = { captureHomeNodeScreenBitmap() },
+                    onLog = { logItem -> appendLog(logItem) }
+                )
+                server.start(NanoHttpdSocketTimeoutMs, false)
+                localFileServer = server
+                activePort = candidatePort
+                return
+            } catch (_: Throwable) {
+                // Try next port if address is already in use
+            }
         }
     }
 
     // =========================================================================
-    // 1. SCREENSHOT BITMAP EXTRACTION (PixelCopy + View Isolation + Live HUD Fallback)
+    // 1. SCREENSHOT BITMAP EXTRACTION (Rate-Limited PixelCopy + Safe Telemetry HUD)
     // =========================================================================
 
     fun captureHomeNodeScreenBitmap(): Bitmap {
-        val activity = activeActivityRef?.get()
-        if (activity != null && !activity.isFinishing && !activity.isDestroyed) {
-            val window = activity.window
-            val decorView = window?.decorView
-            if (decorView != null && decorView.width > 0 && decorView.height > 0) {
-                val targetWidth = 540
-                val targetHeight = ((decorView.height.toFloat() / decorView.width.toFloat()) * targetWidth)
-                    .toInt()
-                    .coerceIn(480, 1200)
+        val now = System.currentTimeMillis()
+        synchronized(screenshotCacheLock) {
+            val cached = cachedScreenshotBitmap
+            if (cached != null && !cached.isRecycled && (now - cachedScreenshotTimeMs) < 400L) {
+                return cached.copy(Bitmap.Config.ARGB_8888, false) ?: renderBackgroundTelemetryBitmap(540, 960)
+            }
+        }
 
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        val captured = captureFreshScreenOrTelemetryBitmap()
+        synchronized(screenshotCacheLock) {
+            cachedScreenshotBitmap = captured
+            cachedScreenshotTimeMs = now
+            return captured.copy(Bitmap.Config.ARGB_8888, false) ?: captured
+        }
+    }
+
+    private fun captureFreshScreenOrTelemetryBitmap(): Bitmap {
+        // Only attempt PixelCopy when called off the Main Thread and when the Activity window is actively visible
+        if (Looper.myLooper() != Looper.getMainLooper() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val activity = activeActivityRef?.get()
+            if (activity != null && !activity.isFinishing && !activity.isDestroyed) {
+                val window = activity.window
+                val decorView = window?.peekDecorView()
+                if (
+                    window != null &&
+                    decorView != null &&
+                    decorView.isAttachedToWindow &&
+                    decorView.isShown &&
+                    decorView.width > 0 &&
+                    decorView.height > 0
+                ) {
+                    val targetWidth = 540
+                    val targetHeight = ((decorView.height.toFloat() / decorView.width.toFloat()) * targetWidth)
+                        .toInt()
+                        .coerceIn(480, 1200)
+
                     try {
                         val pixelBitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
                         val latch = CountDownLatch(1)
@@ -316,34 +411,12 @@ class HomeServerForegroundService : Service() {
                             },
                             mainHandler
                         )
-                        if (latch.await(350, TimeUnit.MILLISECONDS) && copyResult == PixelCopy.SUCCESS) {
+                        if (latch.await(300, TimeUnit.MILLISECONDS) && copyResult == PixelCopy.SUCCESS) {
                             stampLiveOverlayBadge(pixelBitmap)
                             return pixelBitmap
                         }
-                    } catch (_: Exception) {
+                    } catch (_: Throwable) {
                     }
-                }
-
-                try {
-                    val viewBitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
-                    val latch = CountDownLatch(1)
-                    mainHandler.post {
-                        try {
-                            val canvas = Canvas(viewBitmap)
-                            val scaleX = targetWidth.toFloat() / decorView.width.toFloat()
-                            val scaleY = targetHeight.toFloat() / decorView.height.toFloat()
-                            canvas.scale(scaleX, scaleY)
-                            decorView.draw(canvas)
-                        } catch (_: Exception) {
-                        } finally {
-                            latch.countDown()
-                        }
-                    }
-                    if (latch.await(350, TimeUnit.MILLISECONDS)) {
-                        stampLiveOverlayBadge(viewBitmap)
-                        return viewBitmap
-                    }
-                } catch (_: Exception) {
                 }
             }
         }
@@ -369,7 +442,7 @@ class HomeServerForegroundService : Service() {
             paint.textSize = 19f
             paint.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
             canvas.drawText("GLOBAL WEBRTC P2P • BAT $battery% • $timeStr", 62f, 50f, paint)
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
     }
 
@@ -445,105 +518,133 @@ class HomeServerForegroundService : Service() {
     // =========================================================================
 
     private fun initializeWebRtcServerSignaling() {
-        val uid = FirebaseAuth.getInstance().currentUser?.uid ?: return
-        try {
-            if (eglBase == null) {
-                eglBase = EglBase.create()
-            }
-            PeerConnectionFactory.initialize(
-                PeerConnectionFactory.InitializationOptions.builder(applicationContext)
-                    .setEnableInternalTracer(false)
-                    .createInitializationOptions()
-            )
-            val eglContext = eglBase!!.eglBaseContext
-            peerConnectionFactory = PeerConnectionFactory.builder()
-                .setVideoEncoderFactory(DefaultVideoEncoderFactory(eglContext, true, true))
-                .setVideoDecoderFactory(DefaultVideoDecoderFactory(eglContext))
-                .createPeerConnectionFactory()
+        val uid = try {
+            FirebaseAuth.getInstance().currentUser?.uid
+        } catch (_: Throwable) {
+            null
+        }
+        if (uid.isNullOrBlank()) return
 
-            setupLocalVideoTrack()
-            // Publish initial standby Offer so Home Node can act as Offerer OR Answerer seamlessly
-            createAndPublishHomeNodeOffer(uid)
+        try {
+            val sharedFactory = WebRtcP2pClientManager.getSharedPeerConnectionFactory(applicationContext)
+            if (sharedFactory == null) {
+                _webRtcStateText.value = "الخادم نشط (وضع التوافق بدون WebRTC الأصلي)"
+                return
+            }
+            peerConnectionFactory = sharedFactory
+
+            setupLocalVideoSourceOnly()
+
+            // Clear stale signaling state so old cached offers don't re-trigger on startup
+            publishServerSignalingFields(
+                uid = uid,
+                fields = mapOf(
+                    "userId" to uid,
+                    "serverStatus" to "ONLINE_WAITING_FOR_OFFER",
+                    "offerSdp" to "",
+                    "offerType" to "",
+                    "answerSdp" to "",
+                    "answerType" to "",
+                    "serverCandidatesJson" to "[]",
+                    "adminCandidatesJson" to "[]",
+                    "updatedAt" to System.currentTimeMillis()
+                )
+            )
+
             listenForAdminWebRtcSignaling(uid)
-        } catch (e: Exception) {
+        } catch (t: Throwable) {
             appendLog(
                 ServerLog(
                     method = "WEBRTC",
                     endpoint = "/init",
-                    message = "ملاحظة تهيئة WebRTC P2P: ${e.localizedMessage}",
-                    isError = true
+                    message = "ملاحظة تهيئة WebRTC P2P: ${t.localizedMessage ?: t.javaClass.simpleName}",
+                    isError = false
                 )
             )
         }
     }
 
-    private fun setupLocalVideoTrack() {
-        val factory = peerConnectionFactory ?: return
-        val eglContext = eglBase?.eglBaseContext ?: return
+    private fun setupLocalVideoSourceOnly() {
+        synchronized(webRtcLock) {
+            val factory = peerConnectionFactory ?: return
 
-        syntheticFramePumpJob?.cancel()
-        try {
-            screenCapturer?.stopCapture()
-            screenCapturer?.dispose()
-        } catch (_: Exception) {
-        }
-        screenCapturer = null
-
-        videoSource?.dispose()
-        videoSource = factory.createVideoSource(true)
-
-        val projectionData = mediaProjectionPermissionData
-        if (projectionData != null && _isMediaProjectionEnabled.value) {
+            syntheticFramePumpJob?.cancel()
             try {
-                surfaceTextureHelper?.dispose()
-                surfaceTextureHelper = SurfaceTextureHelper.create("ScreenCaptureThread", eglContext)
-                val capturer = ScreenCapturerAndroid(
-                    projectionData,
-                    object : android.media.projection.MediaProjection.Callback() {
-                        override fun onStop() {
-                            super.onStop()
-                            _isMediaProjectionEnabled.value = false
-                        }
-                    }
-                )
-                capturer.initialize(surfaceTextureHelper, applicationContext, videoSource!!.capturerObserver)
-                capturer.startCapture(720, 1280, 30)
-                screenCapturer = capturer
-                _webRtcStateText.value = "متاح عالمياً (MediaProjection 30 FPS)"
-            } catch (_: Exception) {
-                startLiveBitmapVideoFramePump(fps = 15)
+                screenCapturer?.stopCapture()
+                screenCapturer?.dispose()
+            } catch (_: Throwable) {
             }
-        } else {
-            startLiveBitmapVideoFramePump(fps = 15)
-            _webRtcStateText.value = "متاح عالمياً عبر WebRTC P2P"
-        }
+            screenCapturer = null
 
-        localVideoTrack = factory.createVideoTrack("HOME_NODE_SCREEN_TRACK", videoSource)
-        localVideoTrack?.setEnabled(true)
+            if (videoSource == null) {
+                try {
+                    // Use non-screencast source (false) so software NV21 frames never trigger
+                    // hardware MediaCodec screencast surface crashes on older Android devices.
+                    videoSource = factory.createVideoSource(false)
+                } catch (_: Throwable) {
+                }
+            }
+
+            val projectionData = mediaProjectionPermissionData
+            val eglContext = WebRtcP2pClientManager.getSharedEglBase()?.eglBaseContext
+            if (projectionData != null && _isMediaProjectionEnabled.value && eglContext != null && videoSource != null) {
+                try {
+                    surfaceTextureHelper?.dispose()
+                    surfaceTextureHelper = SurfaceTextureHelper.create("ScreenCaptureThread", eglContext)
+                    val capturer = ScreenCapturerAndroid(
+                        projectionData,
+                        object : android.media.projection.MediaProjection.Callback() {
+                            override fun onStop() {
+                                super.onStop()
+                                _isMediaProjectionEnabled.value = false
+                            }
+                        }
+                    )
+                    capturer.initialize(surfaceTextureHelper, applicationContext, videoSource!!.capturerObserver)
+                    capturer.startCapture(540, 960, 15)
+                    screenCapturer = capturer
+                    _webRtcStateText.value = "متاح عالمياً (MediaProjection نشط)"
+                } catch (_: Throwable) {
+                    screenCapturer = null
+                    startLiveBitmapVideoFramePump(fps = 6)
+                }
+            } else {
+                startLiveBitmapVideoFramePump(fps = 6)
+                _webRtcStateText.value = "متاح عالمياً عبر WebRTC P2P"
+            }
+        }
     }
 
     private fun restartWebRtcCapturerIfNeeded() {
         if (!_isRunning.value) return
-        setupLocalVideoTrack()
+        setupLocalVideoSourceOnly()
     }
 
-    private fun startLiveBitmapVideoFramePump(fps: Int = 15) {
+    private fun startLiveBitmapVideoFramePump(fps: Int = 6) {
         syntheticFramePumpJob?.cancel()
-        val intervalMs = (1000L / fps.coerceIn(5, 30))
+        val intervalMs = (1000L / fps.coerceIn(2, 12))
         syntheticFramePumpJob = serviceScope.launch {
             while (isActive && _isRunning.value && screenCapturer == null) {
                 val src = videoSource
-                if (src != null && peerConnection != null) {
+                if (src != null && isPeerSessionActive && peerConnection != null) {
+                    var bmp: Bitmap? = null
                     try {
-                        val bmp = captureHomeNodeScreenBitmap()
+                        bmp = captureHomeNodeScreenBitmap()
                         val w = (bmp.width / 2) * 2
                         val h = (bmp.height / 2) * 2
-                        val nv21 = bitmapToNv21(bmp, w, h)
-                        val buffer = NV21Buffer(nv21, w, h, null)
-                        val frame = VideoFrame(buffer, 0, SystemClock.elapsedRealtimeNanos())
-                        src.capturerObserver.onFrameCaptured(frame)
-                        frame.release()
-                    } catch (_: Exception) {
+                        if (w > 0 && h > 0) {
+                            val nv21 = bitmapToNv21(bmp, w, h)
+                            val buffer = NV21Buffer(nv21, w, h, null)
+                            val frame = VideoFrame(buffer, 0, SystemClock.elapsedRealtimeNanos())
+                            src.capturerObserver.onFrameCaptured(frame)
+                            frame.release()
+                        }
+                    } catch (_: Throwable) {
+                    } finally {
+                        try {
+                            bmp?.recycle()
+                        } catch (_: Throwable) {
+                        }
                     }
                 }
                 delay(intervalMs)
@@ -579,83 +680,66 @@ class HomeServerForegroundService : Service() {
     }
 
     /**
-     * Listens to `users/{uid}/signaling` (and legacy `webrtc_signaling`) in both
-     * Firebase Firestore and Firebase Realtime Database.
+     * Listens to `users/{uid}/signaling` in Firebase Firestore and Realtime Database
+     * with strict session/offer deduplication so multiple listeners never collide.
      */
     private fun listenForAdminWebRtcSignaling(uid: String) {
-        val firestore = FirebaseFirestore.getInstance(
-            applicationContext.getString(R.string.firestore_database_id)
-        )
-        val signalingDoc = firestore.collection("users").document(uid)
-            .collection("signaling").document("main")
-        val legacySignalingDoc = firestore.collection("users").document(uid)
-            .collection("webrtc_signaling").document("main")
+        val firestore = try {
+            FirebaseFirestore.getInstance(
+                applicationContext.getString(R.string.firestore_database_id)
+            )
+        } catch (_: Throwable) {
+            null
+        }
+        val signalingDoc = firestore?.collection("users")?.document(uid)
+            ?.collection("signaling")?.document("main")
 
         fun onSignalingPayload(
             sessionId: String,
             offerSdp: String,
             offerType: String,
-            answerSdp: String,
-            answerType: String,
             adminCandidatesJson: String
         ) {
-            // Case A: Admin sent a fresh SDP Offer (Home Node acts as Callee / Answerer)
-            if (offerSdp.isNotBlank() && offerType.equals("offer", ignoreCase = true) && offerSdp != lastHandledOfferSdp) {
-                lastHandledOfferSdp = offerSdp
-                currentP2pSessionId = sessionId
-                handleIncomingWebRtcOffer(uid, sessionId, offerSdp)
-            }
-            // Case B: Admin answered the Home Node's standby SDP Offer (Home Node acts as Offerer)
-            else if (answerSdp.isNotBlank() && answerType.equals("answer", ignoreCase = true) && answerSdp != lastHandledAnswerSdp) {
-                val pc = peerConnection
-                if (pc != null && pc.signalingState() == PeerConnection.SignalingState.HAVE_LOCAL_OFFER) {
-                    lastHandledAnswerSdp = answerSdp
-                    pc.setRemoteDescription(
-                        object : SimpleSdpObserver() {
-                            override fun onSetSuccess() {
-                                appendLog(
-                                    ServerLog(
-                                        method = "WEBRTC-P2P",
-                                        endpoint = "users/$uid/signaling",
-                                        message = "تم تطبيق SDP Answer من هاتف الآدمن بنجاح"
-                                    )
-                                )
-                            }
-                        },
-                        SessionDescription(SessionDescription.Type.ANSWER, answerSdp)
-                    )
+            if (!_isRunning.value) return
+
+            // Handle fresh SDP Offer from Admin Controller
+            if (offerSdp.isNotBlank() && offerType.equals("offer", ignoreCase = true)) {
+                val offerKey = "${sessionId.ifBlank { "default" }}:${offerSdp.hashCode()}"
+                val shouldHandle = synchronized(webRtcLock) {
+                    if (offerKey != lastHandledOfferKey) {
+                        lastHandledOfferKey = offerKey
+                        currentP2pSessionId = sessionId
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (shouldHandle) {
+                    serviceScope.launch {
+                        handleIncomingWebRtcOffer(uid, sessionId, offerSdp)
+                    }
                 }
             }
 
-            if (adminCandidatesJson.isNotBlank()) {
-                processIncomingAdminCandidates(adminCandidatesJson)
+            if (adminCandidatesJson.isNotBlank() && adminCandidatesJson != "[]") {
+                serviceScope.launch {
+                    processIncomingAdminCandidates(adminCandidatesJson)
+                }
             }
         }
 
-        firestoreSignalingRegistration?.remove()
-        firestoreSignalingRegistration = signalingDoc.addSnapshotListener { snapshot, error ->
-            if (error != null || snapshot == null || !snapshot.exists()) return@addSnapshotListener
-            onSignalingPayload(
-                sessionId = snapshot.getString("sessionId").orEmpty(),
-                offerSdp = snapshot.getString("offerSdp").orEmpty(),
-                offerType = snapshot.getString("offerType").orEmpty(),
-                answerSdp = snapshot.getString("answerSdp").orEmpty(),
-                answerType = snapshot.getString("answerType").orEmpty(),
-                adminCandidatesJson = snapshot.getString("adminCandidatesJson").orEmpty()
-            )
-        }
-
-        legacyFirestoreSignalingRegistration?.remove()
-        legacyFirestoreSignalingRegistration = legacySignalingDoc.addSnapshotListener { snapshot, error ->
-            if (error != null || snapshot == null || !snapshot.exists()) return@addSnapshotListener
-            onSignalingPayload(
-                sessionId = snapshot.getString("sessionId").orEmpty(),
-                offerSdp = snapshot.getString("offerSdp").orEmpty(),
-                offerType = snapshot.getString("offerType").orEmpty(),
-                answerSdp = snapshot.getString("answerSdp").orEmpty(),
-                answerType = snapshot.getString("answerType").orEmpty(),
-                adminCandidatesJson = snapshot.getString("adminCandidatesJson").orEmpty()
-            )
+        try {
+            firestoreSignalingRegistration?.remove()
+            firestoreSignalingRegistration = signalingDoc?.addSnapshotListener { snapshot, error ->
+                if (error != null || snapshot == null || !snapshot.exists()) return@addSnapshotListener
+                onSignalingPayload(
+                    sessionId = snapshot.getString("sessionId").orEmpty(),
+                    offerSdp = snapshot.getString("offerSdp").orEmpty(),
+                    offerType = snapshot.getString("offerType").orEmpty(),
+                    adminCandidatesJson = snapshot.getString("adminCandidatesJson").orEmpty()
+                )
+            }
+        } catch (_: Throwable) {
         }
 
         try {
@@ -670,8 +754,6 @@ class HomeServerForegroundService : Service() {
                         sessionId = snapshot.child("sessionId").getValue(String::class.java).orEmpty(),
                         offerSdp = snapshot.child("offerSdp").getValue(String::class.java).orEmpty(),
                         offerType = snapshot.child("offerType").getValue(String::class.java).orEmpty(),
-                        answerSdp = snapshot.child("answerSdp").getValue(String::class.java).orEmpty(),
-                        answerType = snapshot.child("answerType").getValue(String::class.java).orEmpty(),
                         adminCandidatesJson = snapshot.child("adminCandidatesJson").getValue(String::class.java).orEmpty()
                     )
                 }
@@ -680,157 +762,156 @@ class HomeServerForegroundService : Service() {
             }
             rtdbOfferListener = listener
             ref.addValueEventListener(listener)
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
     }
 
     private fun buildPeerConnection(uid: String, sessionId: String): PeerConnection? {
-        val factory = peerConnectionFactory ?: return null
+        synchronized(webRtcLock) {
+            val factory = peerConnectionFactory ?: return null
 
-        try {
-            activeDataChannel?.close()
-        } catch (_: Exception) {
-        }
-        try {
-            peerConnection?.close()
-        } catch (_: Exception) {
-        }
-        addedRemoteCandidateKeys.clear()
-        synchronized(localServerCandidatesArray) {
-            while (localServerCandidatesArray.length() > 0) {
-                localServerCandidatesArray.remove(0)
+            isPeerSessionActive = false
+
+            try {
+                activeDataChannel?.unregisterObserver()
+            } catch (_: Throwable) {
             }
-        }
-
-        val iceServers = listOf(
-            PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
-            PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer(),
-            PeerConnection.IceServer.builder("stun:stun2.l.google.com:19302").createIceServer(),
-            PeerConnection.IceServer.builder("stun:stun3.l.google.com:19302").createIceServer()
-        )
-        val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
-            sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
-            continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
-        }
-
-        val pc = factory.createPeerConnection(
-            rtcConfig,
-            object : PeerConnection.Observer {
-                override fun onSignalingChange(newState: PeerConnection.SignalingState?) {}
-
-                override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState?) {
-                    val stateLabel = when (newState) {
-                        PeerConnection.IceConnectionState.CONNECTED,
-                        PeerConnection.IceConnectionState.COMPLETED -> "متصل عالمياً عبر P2P (ICE CONNECTED)"
-                        PeerConnection.IceConnectionState.CHECKING -> "جاري التفاوض السحابي (ICE CHECKING)..."
-                        PeerConnection.IceConnectionState.DISCONNECTED -> "انقطع اتصال P2P مؤقتاً"
-                        PeerConnection.IceConnectionState.FAILED -> "فشل مسار ICE المباشر"
-                        else -> "WebRTC P2P: ${newState?.name ?: "STANDBY"}"
-                    }
-                    _webRtcStateText.value = stateLabel
-                    appendLog(
-                        ServerLog(
-                            method = "WEBRTC-P2P",
-                            endpoint = "/ice-state",
-                            message = stateLabel
-                        )
-                    )
-                    serviceScope.launch {
-                        syncNodeStateWithCloud(isOnline = _isRunning.value)
-                    }
-                }
-
-                override fun onIceConnectionReceivingChange(receiving: Boolean) {}
-                override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState?) {}
-
-                override fun onIceCandidate(candidate: IceCandidate?) {
-                    if (candidate == null) return
-                    val candidateObj = JSONObject().apply {
-                        put("sdpMid", candidate.sdpMid ?: "")
-                        put("sdpMLineIndex", candidate.sdpMLineIndex)
-                        put("sdp", candidate.sdp)
-                    }
-                    val serialized: String
-                    synchronized(localServerCandidatesArray) {
-                        localServerCandidatesArray.put(candidateObj)
-                        serialized = localServerCandidatesArray.toString()
-                    }
-                    val fields = mutableMapOf<String, Any>(
-                        "userId" to uid,
-                        "serverCandidatesJson" to serialized,
-                        "updatedAt" to System.currentTimeMillis()
-                    )
-                    if (sessionId.isNotBlank()) {
-                        fields["sessionId"] = sessionId
-                    }
-                    publishServerSignalingFields(uid = uid, fields = fields)
-                }
-
-                override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>?) {}
-                override fun onAddStream(stream: MediaStream?) {}
-                override fun onRemoveStream(stream: MediaStream?) {}
-
-                override fun onDataChannel(dataChannel: DataChannel?) {
-                    if (dataChannel != null) {
-                        registerServerDataChannel(dataChannel)
-                    }
-                }
-
-                override fun onRenegotiationNeeded() {}
-                override fun onAddTrack(receiver: RtpReceiver?, mediaStreams: Array<out MediaStream>?) {}
+            try {
+                activeDataChannel?.close()
+            } catch (_: Throwable) {
             }
-        )
+            activeDataChannel = null
 
-        peerConnection = pc
-        localVideoTrack?.let { track ->
-            pc?.addTrack(track, listOf("HOME_NODE_STREAM"))
-        }
-        return pc
-    }
+            try {
+                peerConnection?.close()
+            } catch (_: Throwable) {
+            }
+            peerConnection = null
 
-    /**
-     * Publishes an initial standby Offer + RTCDataChannel on `users/{uid}/signaling`
-     * so the Home Node is immediately ready as an Offerer, while also ready to Answer new Admin Offers.
-     */
-    private fun createAndPublishHomeNodeOffer(uid: String) {
-        val sessionId = UUID.randomUUID().toString().take(12)
-        currentP2pSessionId = sessionId
-        val pc = buildPeerConnection(uid, sessionId) ?: return
+            addedRemoteCandidateKeys.clear()
+            synchronized(localServerCandidatesArray) {
+                while (localServerCandidatesArray.length() > 0) {
+                    localServerCandidatesArray.remove(0)
+                }
+            }
 
-        val dcInit = DataChannel.Init().apply { ordered = true }
-        val dc = pc.createDataChannel("smart_home_p2p_channel", dcInit)
-        registerServerDataChannel(dc)
+            val iceServers = listOf(
+                PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
+                PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer(),
+                PeerConnection.IceServer.builder("stun:stun2.l.google.com:19302").createIceServer(),
+                PeerConnection.IceServer.builder("stun:stun3.l.google.com:19302").createIceServer()
+            )
+            val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
+                sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+                continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+            }
 
-        val constraints = MediaConstraints().apply {
-            mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
-            mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"))
-        }
-        pc.createOffer(
-            object : SimpleSdpObserver() {
-                override fun onCreateSuccess(desc: SessionDescription?) {
-                    if (desc == null) return
-                    lastHandledOfferSdp = desc.description
-                    pc.setLocalDescription(
-                        object : SimpleSdpObserver() {
-                            override fun onSetSuccess() {
-                                publishServerSignalingFields(
-                                    uid = uid,
-                                    fields = mapOf(
-                                        "userId" to uid,
-                                        "sessionId" to sessionId,
-                                        "offerSdp" to desc.description,
-                                        "offerType" to "offer",
-                                        "updatedAt" to System.currentTimeMillis()
-                                    )
-                                )
+            val pc = try {
+                factory.createPeerConnection(
+                    rtcConfig,
+                    object : PeerConnection.Observer {
+                        override fun onSignalingChange(newState: PeerConnection.SignalingState?) {}
+
+                        override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState?) {
+                            val stateLabel = when (newState) {
+                                PeerConnection.IceConnectionState.CONNECTED,
+                                PeerConnection.IceConnectionState.COMPLETED -> {
+                                    isPeerSessionActive = true
+                                    "متصل عالمياً عبر P2P (ICE CONNECTED)"
+                                }
+                                PeerConnection.IceConnectionState.CHECKING -> {
+                                    isPeerSessionActive = true
+                                    "جاري التفاوض السحابي (ICE CHECKING)..."
+                                }
+                                PeerConnection.IceConnectionState.DISCONNECTED -> {
+                                    isPeerSessionActive = false
+                                    "انقطع اتصال P2P مؤقتاً"
+                                }
+                                PeerConnection.IceConnectionState.FAILED,
+                                PeerConnection.IceConnectionState.CLOSED -> {
+                                    isPeerSessionActive = false
+                                    "بانتظار اتصال P2P جديد"
+                                }
+                                else -> "WebRTC P2P: ${newState?.name ?: "STANDBY"}"
                             }
-                        },
-                        desc
+                            _webRtcStateText.value = stateLabel
+                            appendLog(
+                                ServerLog(
+                                    method = "WEBRTC-P2P",
+                                    endpoint = "/ice-state",
+                                    message = stateLabel
+                                )
+                            )
+                            serviceScope.launch {
+                                syncNodeStateWithCloud(isOnline = _isRunning.value)
+                            }
+                        }
+
+                        override fun onIceConnectionReceivingChange(receiving: Boolean) {}
+                        override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState?) {}
+
+                        override fun onIceCandidate(candidate: IceCandidate?) {
+                            if (candidate == null) return
+                            val candidateObj = JSONObject().apply {
+                                put("sdpMid", candidate.sdpMid ?: "")
+                                put("sdpMLineIndex", candidate.sdpMLineIndex)
+                                put("sdp", candidate.sdp)
+                            }
+                            val serialized: String
+                            synchronized(localServerCandidatesArray) {
+                                localServerCandidatesArray.put(candidateObj)
+                                serialized = localServerCandidatesArray.toString()
+                            }
+                            val fields = mutableMapOf<String, Any>(
+                                "userId" to uid,
+                                "serverCandidatesJson" to serialized,
+                                "updatedAt" to System.currentTimeMillis()
+                            )
+                            if (sessionId.isNotBlank()) {
+                                fields["sessionId"] = sessionId
+                            }
+                            publishServerSignalingFields(uid = uid, fields = fields)
+                        }
+
+                        override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>?) {}
+                        override fun onAddStream(stream: MediaStream?) {}
+                        override fun onRemoveStream(stream: MediaStream?) {}
+
+                        override fun onDataChannel(dataChannel: DataChannel?) {
+                            if (dataChannel != null) {
+                                registerServerDataChannel(dataChannel)
+                            }
+                        }
+
+                        override fun onRenegotiationNeeded() {}
+                        override fun onAddTrack(receiver: RtpReceiver?, mediaStreams: Array<out MediaStream>?) {}
+                    }
+                )
+            } catch (_: Throwable) {
+                null
+            } ?: return null
+
+            peerConnection = pc
+
+            // Always create a fresh VideoTrack per PeerConnection so closed tracks are never reused
+            try {
+                val src = videoSource
+                if (src != null) {
+                    val freshTrack = factory.createVideoTrack(
+                        "HOME_NODE_TRACK_${UUID.randomUUID().toString().take(6)}",
+                        src
                     )
+                    freshTrack?.setEnabled(true)
+                    localVideoTrack = freshTrack
+                    if (freshTrack != null) {
+                        pc.addTrack(freshTrack, listOf("HOME_NODE_STREAM"))
+                    }
                 }
-            },
-            constraints
-        )
+            } catch (_: Throwable) {
+            }
+
+            return pc
+        }
     }
 
     private fun handleIncomingWebRtcOffer(uid: String, sessionId: String, offerSdp: String) {
@@ -844,51 +925,60 @@ class HomeServerForegroundService : Service() {
 
         val pc = buildPeerConnection(uid, sessionId) ?: return
 
-        val remoteOffer = SessionDescription(SessionDescription.Type.OFFER, offerSdp)
-        pc.setRemoteDescription(
-            object : SimpleSdpObserver() {
-                override fun onSetSuccess() {
-                    val constraints = MediaConstraints().apply {
-                        mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
-                        mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"))
-                    }
-                    pc.createAnswer(
-                        object : SimpleSdpObserver() {
-                            override fun onCreateSuccess(desc: SessionDescription?) {
-                                if (desc == null) return
-                                lastHandledAnswerSdp = desc.description
-                                pc.setLocalDescription(
-                                    object : SimpleSdpObserver() {
-                                        override fun onSetSuccess() {
-                                            val fields = mutableMapOf<String, Any>(
-                                                "userId" to uid,
-                                                "answerSdp" to desc.description,
-                                                "answerType" to "answer",
-                                                "updatedAt" to System.currentTimeMillis()
-                                            )
-                                            if (sessionId.isNotBlank()) {
-                                                fields["sessionId"] = sessionId
-                                            }
-                                            publishServerSignalingFields(uid = uid, fields = fields)
-                                            appendLog(
-                                                ServerLog(
-                                                    method = "WEBRTC-P2P",
-                                                    endpoint = "users/$uid/signaling",
-                                                    message = "تم إرسال SDP Answer عبر السحابة بنجاح"
-                                                )
-                                            )
-                                        }
-                                    },
-                                    desc
-                                )
+        try {
+            val remoteOffer = SessionDescription(SessionDescription.Type.OFFER, offerSdp)
+            pc.setRemoteDescription(
+                object : SimpleSdpObserver() {
+                    override fun onSetSuccess() {
+                        try {
+                            val constraints = MediaConstraints().apply {
+                                mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
+                                mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"))
                             }
-                        },
-                        constraints
-                    )
-                }
-            },
-            remoteOffer
-        )
+                            pc.createAnswer(
+                                object : SimpleSdpObserver() {
+                                    override fun onCreateSuccess(desc: SessionDescription?) {
+                                        if (desc == null) return
+                                        try {
+                                            pc.setLocalDescription(
+                                                object : SimpleSdpObserver() {
+                                                    override fun onSetSuccess() {
+                                                        isPeerSessionActive = true
+                                                        val fields = mutableMapOf<String, Any>(
+                                                            "userId" to uid,
+                                                            "answerSdp" to desc.description,
+                                                            "answerType" to "answer",
+                                                            "updatedAt" to System.currentTimeMillis()
+                                                        )
+                                                        if (sessionId.isNotBlank()) {
+                                                            fields["sessionId"] = sessionId
+                                                        }
+                                                        publishServerSignalingFields(uid = uid, fields = fields)
+                                                        appendLog(
+                                                            ServerLog(
+                                                                method = "WEBRTC-P2P",
+                                                                endpoint = "users/$uid/signaling",
+                                                                message = "تم إرسال SDP Answer عبر السحابة بنجاح"
+                                                            )
+                                                        )
+                                                    }
+                                                },
+                                                desc
+                                            )
+                                        } catch (_: Throwable) {
+                                        }
+                                    }
+                                },
+                                constraints
+                            )
+                        } catch (_: Throwable) {
+                        }
+                    }
+                },
+                remoteOffer
+            )
+        } catch (_: Throwable) {
+        }
     }
 
     // =========================================================================
@@ -897,45 +987,56 @@ class HomeServerForegroundService : Service() {
 
     private fun registerServerDataChannel(channel: DataChannel) {
         activeDataChannel = channel
-        channel.registerObserver(
-            object : DataChannel.Observer {
-                override fun onBufferedAmountChange(previousAmount: Long) {}
+        try {
+            channel.registerObserver(
+                object : DataChannel.Observer {
+                    override fun onBufferedAmountChange(previousAmount: Long) {}
 
-                override fun onStateChange() {
-                    val state = channel.state()
-                    if (state == DataChannel.State.OPEN) {
-                        _webRtcStateText.value = "متصل عالمياً عبر P2P (RTCDataChannel نشط)"
-                        appendLog(
-                            ServerLog(
-                                method = "DATACHANNEL",
-                                endpoint = channel.label(),
-                                message = "تم فتح قناة البيانات المباشرة RTCDataChannel بنجاح مع هاتف الآدمن"
+                    override fun onStateChange() {
+                        val state = try {
+                            channel.state()
+                        } catch (_: Throwable) {
+                            return
+                        }
+                        if (state == DataChannel.State.OPEN) {
+                            isPeerSessionActive = true
+                            _webRtcStateText.value = "متصل عالمياً عبر P2P (RTCDataChannel نشط)"
+                            appendLog(
+                                ServerLog(
+                                    method = "DATACHANNEL",
+                                    endpoint = channel.label(),
+                                    message = "تم فتح قناة البيانات المباشرة RTCDataChannel بنجاح مع هاتف الآدمن"
+                                )
                             )
-                        )
-                    } else if (state == DataChannel.State.CLOSED) {
-                        _webRtcStateText.value = "بانتظار اتصال P2P جديد"
+                        } else if (state == DataChannel.State.CLOSED) {
+                            _webRtcStateText.value = "بانتظار اتصال P2P جديد"
+                        }
                     }
-                }
 
-                override fun onMessage(buffer: DataChannel.Buffer?) {
-                    if (buffer == null) return
-                    val bytes = ByteArray(buffer.data.remaining())
-                    buffer.data.get(bytes)
-                    if (!buffer.binary) {
-                        val rawJson = String(bytes, StandardCharsets.UTF_8)
-                        serviceScope.launch {
-                            handleDataChannelCommand(channel, rawJson)
+                    override fun onMessage(buffer: DataChannel.Buffer?) {
+                        if (buffer == null) return
+                        try {
+                            val bytes = ByteArray(buffer.data.remaining())
+                            buffer.data.get(bytes)
+                            if (!buffer.binary) {
+                                val rawJson = String(bytes, StandardCharsets.UTF_8)
+                                serviceScope.launch {
+                                    handleDataChannelCommand(channel, rawJson)
+                                }
+                            }
+                        } catch (_: Throwable) {
                         }
                     }
                 }
-            }
-        )
+            )
+        } catch (_: Throwable) {
+        }
     }
 
     private suspend fun handleDataChannelCommand(channel: DataChannel, rawJson: String) {
         val request = try {
             JSONObject(rawJson)
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             return
         }
 
@@ -1010,10 +1111,10 @@ class HomeServerForegroundService : Service() {
                     )
                 }
 
-                val rootCanonical = rootDir.canonicalPath
-                val currentCanonical = targetDir.canonicalPath
+                val rootCanonical = try { rootDir.canonicalPath } catch (_: Throwable) { rootDir.absolutePath }
+                val currentCanonical = try { targetDir.canonicalPath } catch (_: Throwable) { targetDir.absolutePath }
                 val parentPath = if (currentCanonical != rootCanonical) {
-                    targetDir.parentFile?.canonicalPath.orEmpty()
+                    try { targetDir.parentFile?.canonicalPath.orEmpty() } catch (_: Throwable) { targetDir.parentFile?.absolutePath.orEmpty() }
                 } else {
                     ""
                 }
@@ -1038,8 +1139,9 @@ class HomeServerForegroundService : Service() {
 
             "/screenshot" -> {
                 val quality = request.optInt("quality", 70).coerceIn(30, 95)
+                var bitmap: Bitmap? = null
                 try {
-                    val bitmap = captureHomeNodeScreenBitmap()
+                    bitmap = captureHomeNodeScreenBitmap()
                     val baos = ByteArrayOutputStream()
                     bitmap.compress(Bitmap.CompressFormat.JPEG, quality, baos)
                     val base64Jpeg = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
@@ -1051,7 +1153,7 @@ class HomeServerForegroundService : Service() {
                         put("timestamp", System.currentTimeMillis())
                     }
                     sendDataChannelJson(channel, response)
-                } catch (e: Exception) {
+                } catch (e: Throwable) {
                     sendDataChannelJson(
                         channel,
                         JSONObject().apply {
@@ -1060,6 +1162,11 @@ class HomeServerForegroundService : Service() {
                             put("error", e.localizedMessage ?: "فشل التقاط الشاشة")
                         }
                     )
+                } finally {
+                    try {
+                        bitmap?.recycle()
+                    } catch (_: Throwable) {
+                    }
                 }
             }
 
@@ -1067,7 +1174,9 @@ class HomeServerForegroundService : Service() {
                 val path = request.optString("path", "")
                 val rootDir = resolveStorageRootDir()
                 val targetFile = resolveSafeFile(rootDir, path)
-                if (targetFile == null || !targetFile.exists() || targetFile.canonicalPath == rootDir.canonicalPath) {
+                val rootCanonical = try { rootDir.canonicalPath } catch (_: Throwable) { rootDir.absolutePath }
+                val targetCanonical = try { targetFile?.canonicalPath } catch (_: Throwable) { targetFile?.absolutePath }
+                if (targetFile == null || !targetFile.exists() || targetCanonical == rootCanonical) {
                     sendDataChannelJson(
                         channel,
                         JSONObject().apply {
@@ -1078,7 +1187,7 @@ class HomeServerForegroundService : Service() {
                     )
                     return
                 }
-                val deleted = targetFile.deleteRecursively()
+                val deleted = try { targetFile.deleteRecursively() } catch (_: Throwable) { false }
                 sendDataChannelJson(
                     channel,
                     JSONObject().apply {
@@ -1139,7 +1248,7 @@ class HomeServerForegroundService : Service() {
                             if (read <= 0) break
 
                             var backpressureWait = 0
-                            while (channel.bufferedAmount() > 1_048_576L && backpressureWait < 100) {
+                            while (try { channel.bufferedAmount() > 1_048_576L } catch (_: Throwable) { false } && backpressureWait < 100) {
                                 delay(25L)
                                 backpressureWait++
                             }
@@ -1164,7 +1273,7 @@ class HomeServerForegroundService : Service() {
                             put("type", "download_end")
                         }
                     )
-                } catch (e: Exception) {
+                } catch (e: Throwable) {
                     sendDataChannelJson(
                         channel,
                         JSONObject().apply {
@@ -1201,7 +1310,7 @@ class HomeServerForegroundService : Service() {
                             put("success", true)
                         }
                     )
-                } catch (e: Exception) {
+                } catch (e: Throwable) {
                     sendDataChannelJson(
                         channel,
                         JSONObject().apply {
@@ -1222,7 +1331,7 @@ class HomeServerForegroundService : Service() {
                         val bytes = Base64.decode(base64Data, Base64.NO_WRAP)
                         session.outputStream.write(bytes)
                         session.receivedBytes += bytes.size
-                    } catch (_: Exception) {
+                    } catch (_: Throwable) {
                     }
                 }
             }
@@ -1234,7 +1343,7 @@ class HomeServerForegroundService : Service() {
                     try {
                         session.outputStream.flush()
                         session.outputStream.close()
-                    } catch (_: Exception) {
+                    } catch (_: Throwable) {
                     }
                     appendLog(
                         ServerLog(
@@ -1265,7 +1374,7 @@ class HomeServerForegroundService : Service() {
                 if (raw.isAbsolute) raw.canonicalFile else File(rootCanonical, requestedPath).canonicalFile
             }
             if (candidate.path.startsWith(rootCanonical.path)) candidate else rootCanonical
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             null
         }
     }
@@ -1275,26 +1384,28 @@ class HomeServerForegroundService : Service() {
             if (channel.state() != DataChannel.State.OPEN) return false
             val bytes = json.toString().toByteArray(StandardCharsets.UTF_8)
             channel.send(DataChannel.Buffer(ByteBuffer.wrap(bytes), false))
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             false
         }
     }
 
     private fun processIncomingAdminCandidates(candidatesJson: String) {
-        val pc = peerConnection ?: return
-        try {
-            val array = JSONArray(candidatesJson)
-            for (i in 0 until array.length()) {
-                val obj = array.getJSONObject(i)
-                val sdp = obj.optString("sdp")
-                val sdpMid = obj.optString("sdpMid")
-                val sdpMLineIndex = obj.optInt("sdpMLineIndex", 0)
-                val key = "$sdpMid:$sdpMLineIndex:$sdp"
-                if (sdp.isNotBlank() && addedRemoteCandidateKeys.add(key)) {
-                    pc.addIceCandidate(IceCandidate(sdpMid, sdpMLineIndex, sdp))
+        synchronized(webRtcLock) {
+            val pc = peerConnection ?: return
+            try {
+                val array = JSONArray(candidatesJson)
+                for (i in 0 until array.length()) {
+                    val obj = array.getJSONObject(i)
+                    val sdp = obj.optString("sdp")
+                    val sdpMid = obj.optString("sdpMid")
+                    val sdpMLineIndex = obj.optInt("sdpMLineIndex", 0)
+                    val key = "$sdpMid:$sdpMLineIndex:$sdp"
+                    if (sdp.isNotBlank() && addedRemoteCandidateKeys.add(key)) {
+                        pc.addIceCandidate(IceCandidate(sdpMid, sdpMLineIndex, sdp))
+                    }
                 }
+            } catch (_: Throwable) {
             }
-        } catch (_: Exception) {
         }
     }
 
@@ -1309,63 +1420,72 @@ class HomeServerForegroundService : Service() {
             firestore.collection("users").document(uid)
                 .collection("webrtc_signaling").document("main")
                 .set(fields, SetOptions.merge())
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
 
         try {
             rtdbSignalingRef?.updateChildren(fields)
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
     }
 
     private fun releaseWebRtcResources() {
-        syntheticFramePumpJob?.cancel()
-        firestoreSignalingRegistration?.remove()
-        firestoreSignalingRegistration = null
-        legacyFirestoreSignalingRegistration?.remove()
-        legacyFirestoreSignalingRegistration = null
-        try {
-            rtdbOfferListener?.let { rtdbSignalingRef?.removeEventListener(it) }
-        } catch (_: Exception) {
+        synchronized(webRtcLock) {
+            isPeerSessionActive = false
+            syntheticFramePumpJob?.cancel()
+            try {
+                firestoreSignalingRegistration?.remove()
+            } catch (_: Throwable) {
+            }
+            firestoreSignalingRegistration = null
+            try {
+                legacyFirestoreSignalingRegistration?.remove()
+            } catch (_: Throwable) {
+            }
+            legacyFirestoreSignalingRegistration = null
+            try {
+                rtdbOfferListener?.let { rtdbSignalingRef?.removeEventListener(it) }
+            } catch (_: Throwable) {
+            }
+            rtdbOfferListener = null
+
+            try {
+                activeDataChannel?.unregisterObserver()
+            } catch (_: Throwable) {
+            }
+            try {
+                activeDataChannel?.close()
+            } catch (_: Throwable) {
+            }
+            activeDataChannel = null
+
+            try {
+                screenCapturer?.stopCapture()
+                screenCapturer?.dispose()
+            } catch (_: Throwable) {
+            }
+            screenCapturer = null
+
+            try {
+                peerConnection?.close()
+            } catch (_: Throwable) {
+            }
+            peerConnection = null
+
+            try {
+                surfaceTextureHelper?.dispose()
+            } catch (_: Throwable) {
+            }
+            surfaceTextureHelper = null
+
+            try {
+                videoSource?.dispose()
+            } catch (_: Throwable) {
+            }
+            videoSource = null
+            localVideoTrack = null
+            peerConnectionFactory = null
         }
-        try {
-            activeDataChannel?.close()
-            activeDataChannel?.dispose()
-        } catch (_: Exception) {
-        }
-        activeDataChannel = null
-        try {
-            screenCapturer?.stopCapture()
-            screenCapturer?.dispose()
-        } catch (_: Exception) {
-        }
-        screenCapturer = null
-        try {
-            peerConnection?.close()
-            peerConnection?.dispose()
-        } catch (_: Exception) {
-        }
-        peerConnection = null
-        try {
-            videoSource?.dispose()
-        } catch (_: Exception) {
-        }
-        videoSource = null
-        try {
-            surfaceTextureHelper?.dispose()
-        } catch (_: Exception) {
-        }
-        surfaceTextureHelper = null
-        try {
-            peerConnectionFactory?.dispose()
-        } catch (_: Exception) {
-        }
-        peerConnectionFactory = null
-        try {
-            eglBase?.release()
-        } catch (_: Exception) {
-        }
-        eglBase = null
     }
 
     // =========================================================================
@@ -1383,11 +1503,15 @@ class HomeServerForegroundService : Service() {
     }
 
     private suspend fun syncNodeStateWithCloud(isOnline: Boolean) {
-        val uid = FirebaseAuth.getInstance().currentUser?.uid.orEmpty()
+        val uid = try {
+            FirebaseAuth.getInstance().currentUser?.uid.orEmpty()
+        } catch (_: Throwable) {
+            ""
+        }
         val signalingPath = if (uid.isNotBlank()) "users/$uid/signaling" else "users/{uid}/signaling"
         val (battery, freeBytes, totalBytes) = readHardwareStatus()
         val deviceName = "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}".trim()
-        val p2pState = if (activeDataChannel?.state() == DataChannel.State.OPEN) {
+        val p2pState = if (try { activeDataChannel?.state() == DataChannel.State.OPEN } catch (_: Throwable) { false }) {
             "P2P_CONNECTED"
         } else {
             "WAITING_FOR_PEER"
@@ -1412,7 +1536,13 @@ class HomeServerForegroundService : Service() {
         _currentNodeInfo.value = info
         updateForegroundNotification(signalingPath)
 
-        val result = repository.publishHomeNodeInfo(info, registerOnDisconnect = isOnline)
+        val repo = repository ?: try {
+            SmartCloudRepository(applicationContext).also { repository = it }
+        } catch (_: Throwable) {
+            null
+        } ?: return
+
+        val result = repo.publishHomeNodeInfo(info, registerOnDisconnect = isOnline)
         result.onFailure { error ->
             appendLog(
                 ServerLog(
@@ -1427,33 +1557,33 @@ class HomeServerForegroundService : Service() {
     }
 
     private fun registerNetworkCallback() {
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
-        connectivityManager = cm
-
-        val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
-                super.onLinkPropertiesChanged(network, linkProperties)
-                serviceScope.launch {
-                    syncNodeStateWithCloud(isOnline = true)
-                }
-            }
-
-            override fun onAvailable(network: Network) {
-                super.onAvailable(network)
-                serviceScope.launch {
-                    delay(1000L)
-                    syncNodeStateWithCloud(isOnline = true)
-                }
-            }
-        }
-
-        networkCallback = callback
         try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+            connectivityManager = cm
+
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                    super.onLinkPropertiesChanged(network, linkProperties)
+                    serviceScope.launch {
+                        syncNodeStateWithCloud(isOnline = true)
+                    }
+                }
+
+                override fun onAvailable(network: Network) {
+                    super.onAvailable(network)
+                    serviceScope.launch {
+                        delay(1000L)
+                        syncNodeStateWithCloud(isOnline = true)
+                    }
+                }
+            }
+
+            networkCallback = callback
             val request = NetworkRequest.Builder()
                 .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
                 .build()
             cm.registerNetworkCallback(request, callback)
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
     }
 
@@ -1467,7 +1597,7 @@ class HomeServerForegroundService : Service() {
                 setReferenceCounted(false)
                 acquire()
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
 
         try {
@@ -1482,7 +1612,7 @@ class HomeServerForegroundService : Service() {
                 setReferenceCounted(false)
                 acquire()
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
     }
 
@@ -1491,7 +1621,7 @@ class HomeServerForegroundService : Service() {
             if (wakeLock?.isHeld == true) {
                 wakeLock?.release()
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
         wakeLock = null
 
@@ -1499,37 +1629,41 @@ class HomeServerForegroundService : Service() {
             if (wifiLock?.isHeld == true) {
                 wifiLock?.release()
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
         wifiLock = null
     }
 
     private fun readHardwareStatus(): Triple<Int, Long, Long> {
-        val bm = getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
-        val battery = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
-            ?.takeIf { it in 0..100 } ?: 100
-
-        val rootDir = resolveStorageRootDir()
         return try {
+            val bm = getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
+            val battery = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                ?.takeIf { it in 0..100 } ?: 100
+
+            val rootDir = resolveStorageRootDir()
             val statFs = StatFs(rootDir.absolutePath)
             val freeBytes = statFs.availableBytes
             val totalBytes = statFs.totalBytes
             Triple(battery, freeBytes, totalBytes)
-        } catch (_: Exception) {
-            Triple(battery, 0L, 0L)
+        } catch (_: Throwable) {
+            Triple(100, 0L, 0L)
         }
     }
 
     private fun resolveStorageRootDir(): File {
-        val externalRoot = Environment.getExternalStorageDirectory()
-        if (externalRoot.exists() && externalRoot.canRead() && !externalRoot.listFiles().isNullOrEmpty()) {
-            return externalRoot
+        return try {
+            val externalRoot = Environment.getExternalStorageDirectory()
+            if (externalRoot != null && externalRoot.exists() && externalRoot.canRead() && !externalRoot.listFiles().isNullOrEmpty()) {
+                return externalRoot
+            }
+            val appExternal = getExternalFilesDir(null)
+            if (appExternal != null && appExternal.exists() && appExternal.canRead()) {
+                return appExternal
+            }
+            filesDir
+        } catch (_: Throwable) {
+            filesDir
         }
-        val appExternal = getExternalFilesDir(null)
-        if (appExternal != null && appExternal.exists() && appExternal.canRead()) {
-            return appExternal
-        }
-        return filesDir
     }
 
     private fun ensureSampleCloudFilesIfNeeded() {
@@ -1549,7 +1683,7 @@ class HomeServerForegroundService : Service() {
                 val mediaDir = File(cloudFolder, "Media_Samples").apply { mkdirs() }
                 createSampleWavFile(File(mediaDir, "SmartHome_Chime_Sample.wav"))
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
     }
 
@@ -1600,18 +1734,19 @@ class HomeServerForegroundService : Service() {
 
     private fun stopServerAndSelf() {
         _isRunning.value = false
+        serverBootJob?.cancel()
         heartbeatJob?.cancel()
         releaseWebRtcResources()
 
         try {
             localFileServer?.stop()
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
         localFileServer = null
 
         try {
             networkCallback?.let { connectivityManager?.unregisterNetworkCallback(it) }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
         networkCallback = null
 
@@ -1625,14 +1760,17 @@ class HomeServerForegroundService : Service() {
                     lastUpdated = System.currentTimeMillis()
                 )
                 _currentNodeInfo.value = offlineNode
-                repository.markHomeNodeOffline(offlineNode)
-            } catch (_: Exception) {
+                repository?.markHomeNodeOffline(offlineNode)
+            } catch (_: Throwable) {
             } finally {
                 try {
                     stopForeground(STOP_FOREGROUND_REMOVE)
                 } catch (_: Throwable) {
                 }
-                stopSelf()
+                try {
+                    stopSelf()
+                } catch (_: Throwable) {
+                }
             }
         }
     }
@@ -1704,8 +1842,10 @@ class HomeServerForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        // Use monochrome vector icon R.drawable.ic_stat_cloud_server (never AdaptiveIconDrawable)
+        // to prevent StatusBarManagerService RemoteServiceException on Android 8-16.
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_stat_cloud_server)
             .setContentTitle(getString(R.string.server_running_title))
             .setContentText("متاح عالمياً عبر WebRTC P2P ($signalingPath)")
             .setOngoing(true)

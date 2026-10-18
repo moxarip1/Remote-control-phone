@@ -27,7 +27,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
@@ -46,6 +45,8 @@ import org.webrtc.RtpReceiver
 import org.webrtc.RtpTransceiver
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
+import org.webrtc.SoftwareVideoDecoderFactory
+import org.webrtc.SoftwareVideoEncoderFactory
 import org.webrtc.VideoTrack
 import java.io.File
 import java.io.FileOutputStream
@@ -66,8 +67,11 @@ class WebRtcP2pClientManager(
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    val eglBase: EglBase = EglBase.create()
-    private var peerConnectionFactory: PeerConnectionFactory? = null
+    // Lazily accessed shared EglBase so instantiating WebRtcP2pClientManager on startup never crashes
+    // or allocates duplicate OpenGL contexts on the Home Node Server phone.
+    val eglBase: EglBase?
+        get() = getSharedEglBase()
+
     private var peerConnection: PeerConnection? = null
     private var commandDataChannel: DataChannel? = null
 
@@ -107,29 +111,11 @@ class WebRtcP2pClientManager(
 
     private val activeDownloads = ConcurrentHashMap<String, IncomingDownloadSession>()
 
-    init {
-        initializeFactory()
-    }
-
-    private fun initializeFactory() {
-        try {
-            PeerConnectionFactory.initialize(
-                PeerConnectionFactory.InitializationOptions.builder(appContext)
-                    .setEnableInternalTracer(false)
-                    .createInitializationOptions()
-            )
-            peerConnectionFactory = PeerConnectionFactory.builder()
-                .setVideoEncoderFactory(DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true))
-                .setVideoDecoderFactory(DefaultVideoDecoderFactory(eglBase.eglBaseContext))
-                .createPeerConnectionFactory()
-        } catch (_: Exception) {
-        }
-    }
-
     /**
      * Initiates or refreshes the global WebRTC PeerConnection & RTCDataChannel with the Home Node
      * using Firebase Signaling at `users/{uid}/signaling`.
      */
+    @Synchronized
     fun connectToHomeNodeP2p(
         userId: String = FirebaseAuth.getInstance().currentUser?.uid.orEmpty(),
         secretToken: String = "",
@@ -150,9 +136,10 @@ class WebRtcP2pClientManager(
         cleanupActiveConnectionOnly()
         _p2pConnectionStatus.value = "جاري إنشاء نفق WebRTC P2P العالمي عبر Firebase Signaling..."
 
-        val factory = peerConnectionFactory ?: run {
-            initializeFactory()
-            peerConnectionFactory ?: return
+        val factory = getSharedPeerConnectionFactory(appContext)
+        if (factory == null) {
+            _p2pConnectionStatus.value = "وضع التوافق النشط (تعذر تهيئة محرك WebRTC الأصلي على هذا الجهاز)"
+            return
         }
 
         val iceServers = listOf(
@@ -170,140 +157,153 @@ class WebRtcP2pClientManager(
         val addedServerCandidates = mutableSetOf<String>()
         var isRemoteAnswerApplied = false
 
-        val firestore = FirebaseFirestore.getInstance(
-            appContext.getString(R.string.firestore_database_id)
-        )
-        val signalingDoc = firestore.collection("users").document(userId)
-            .collection("signaling").document("main")
-        val legacySignalingDoc = firestore.collection("users").document(userId)
-            .collection("webrtc_signaling").document("main")
+        val firestore = try {
+            FirebaseFirestore.getInstance(
+                appContext.getString(R.string.firestore_database_id)
+            )
+        } catch (_: Throwable) {
+            null
+        }
+        val signalingDoc = firestore?.collection("users")?.document(userId)
+            ?.collection("signaling")?.document("main")
+        val legacySignalingDoc = firestore?.collection("users")?.document(userId)
+            ?.collection("webrtc_signaling")?.document("main")
 
         val rtdbRef = try {
             FirebaseDatabase.getInstance()
                 .getReference("users")
                 .child(userId)
                 .child("signaling")
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             null
         }
         rtdbSignalingRef = rtdbRef
 
         fun publishSignalingFields(fields: Map<String, Any>) {
             try {
-                signalingDoc.set(fields, SetOptions.merge())
-                legacySignalingDoc.set(fields, SetOptions.merge())
-            } catch (_: Exception) {
+                signalingDoc?.set(fields, SetOptions.merge())
+                legacySignalingDoc?.set(fields, SetOptions.merge())
+            } catch (_: Throwable) {
             }
             try {
                 rtdbRef?.updateChildren(fields)
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
             }
         }
 
-        val pc = factory.createPeerConnection(
-            rtcConfig,
-            object : PeerConnection.Observer {
-                override fun onSignalingChange(newState: PeerConnection.SignalingState?) {}
+        val pc = try {
+            factory.createPeerConnection(
+                rtcConfig,
+                object : PeerConnection.Observer {
+                    override fun onSignalingChange(newState: PeerConnection.SignalingState?) {}
 
-                override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState?) {
-                    when (newState) {
-                        PeerConnection.IceConnectionState.CHECKING -> {
-                            _p2pConnectionStatus.value = "جاري عبور الجدران النارية (STUN/ICE Checking)..."
+                    override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState?) {
+                        when (newState) {
+                            PeerConnection.IceConnectionState.CHECKING -> {
+                                _p2pConnectionStatus.value = "جاري عبور الجدران النارية (STUN/ICE Checking)..."
+                            }
+                            PeerConnection.IceConnectionState.CONNECTED,
+                            PeerConnection.IceConnectionState.COMPLETED -> {
+                                _isP2pConnected.value = true
+                                _p2pConnectionStatus.value = "متصل عالمياً عبر WebRTC P2P (RTCDataChannel نشط)"
+                            }
+                            PeerConnection.IceConnectionState.DISCONNECTED -> {
+                                _isP2pConnected.value = false
+                                _p2pConnectionStatus.value = "انقطع نفق WebRTC P2P مؤقتاً"
+                            }
+                            PeerConnection.IceConnectionState.FAILED -> {
+                                _isP2pConnected.value = false
+                                _p2pConnectionStatus.value = "تعذر إكمال مسار ICE المباشر — اضغط تحديث لإعادة المحاولة"
+                            }
+                            PeerConnection.IceConnectionState.CLOSED -> {
+                                _isP2pConnected.value = false
+                                _p2pConnectionStatus.value = "تم إغلاق اتصال P2P"
+                            }
+                            else -> {}
                         }
-                        PeerConnection.IceConnectionState.CONNECTED,
-                        PeerConnection.IceConnectionState.COMPLETED -> {
-                            _isP2pConnected.value = true
-                            _p2pConnectionStatus.value = "متصل عالمياً عبر WebRTC P2P (RTCDataChannel نشط)"
-                        }
-                        PeerConnection.IceConnectionState.DISCONNECTED -> {
-                            _isP2pConnected.value = false
-                            _p2pConnectionStatus.value = "انقطع نفق WebRTC P2P مؤقتاً"
-                        }
-                        PeerConnection.IceConnectionState.FAILED -> {
-                            _isP2pConnected.value = false
-                            _p2pConnectionStatus.value = "تعذر إكمال مسار ICE المباشر — اضغط تحديث لإعادة المحاولة"
-                        }
-                        PeerConnection.IceConnectionState.CLOSED -> {
-                            _isP2pConnected.value = false
-                            _p2pConnectionStatus.value = "تم إغلاق اتصال P2P"
-                        }
-                        else -> {}
                     }
-                }
 
-                override fun onIceConnectionReceivingChange(receiving: Boolean) {}
-                override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState?) {}
+                    override fun onIceConnectionReceivingChange(receiving: Boolean) {}
+                    override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState?) {}
 
-                override fun onIceCandidate(candidate: IceCandidate?) {
-                    if (candidate == null) return
-                    val obj = JSONObject().apply {
-                        put("sdpMid", candidate.sdpMid ?: "")
-                        put("sdpMLineIndex", candidate.sdpMLineIndex)
-                        put("sdp", candidate.sdp)
-                    }
-                    val serialized: String
-                    synchronized(adminCandidatesArray) {
-                        adminCandidatesArray.put(obj)
-                        serialized = adminCandidatesArray.toString()
-                    }
-                    publishSignalingFields(
-                        mapOf(
-                            "userId" to userId,
-                            "sessionId" to sessionId,
-                            "adminCandidatesJson" to serialized,
-                            "updatedAt" to System.currentTimeMillis()
+                    override fun onIceCandidate(candidate: IceCandidate?) {
+                        if (candidate == null) return
+                        val obj = JSONObject().apply {
+                            put("sdpMid", candidate.sdpMid ?: "")
+                            put("sdpMLineIndex", candidate.sdpMLineIndex)
+                            put("sdp", candidate.sdp)
+                        }
+                        val serialized: String
+                        synchronized(adminCandidatesArray) {
+                            adminCandidatesArray.put(obj)
+                            serialized = adminCandidatesArray.toString()
+                        }
+                        publishSignalingFields(
+                            mapOf(
+                                "userId" to userId,
+                                "sessionId" to sessionId,
+                                "adminCandidatesJson" to serialized,
+                                "updatedAt" to System.currentTimeMillis()
+                            )
                         )
-                    )
-                }
+                    }
 
-                override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>?) {}
+                    override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>?) {}
 
-                override fun onAddStream(stream: MediaStream?) {
-                    stream?.videoTracks?.firstOrNull()?.let { track ->
-                        _remoteVideoTrack.value = track
+                    override fun onAddStream(stream: MediaStream?) {
+                        stream?.videoTracks?.firstOrNull()?.let { track ->
+                            _remoteVideoTrack.value = track
+                        }
+                    }
+
+                    override fun onRemoveStream(stream: MediaStream?) {}
+
+                    override fun onDataChannel(dataChannel: DataChannel?) {
+                        if (dataChannel != null) {
+                            attachDataChannelObserver(dataChannel)
+                        }
+                    }
+
+                    override fun onRenegotiationNeeded() {}
+
+                    override fun onAddTrack(receiver: RtpReceiver?, mediaStreams: Array<out MediaStream>?) {
+                        val track = receiver?.track() as? VideoTrack
+                        if (track != null) {
+                            _remoteVideoTrack.value = track
+                        }
+                    }
+
+                    override fun onTrack(transceiver: RtpTransceiver?) {
+                        val track = transceiver?.receiver?.track() as? VideoTrack
+                        if (track != null) {
+                            _remoteVideoTrack.value = track
+                        }
                     }
                 }
-
-                override fun onRemoveStream(stream: MediaStream?) {}
-
-                override fun onDataChannel(dataChannel: DataChannel?) {
-                    if (dataChannel != null) {
-                        attachDataChannelObserver(dataChannel)
-                    }
-                }
-
-                override fun onRenegotiationNeeded() {}
-
-                override fun onAddTrack(receiver: RtpReceiver?, mediaStreams: Array<out MediaStream>?) {
-                    val track = receiver?.track() as? VideoTrack
-                    if (track != null) {
-                        _remoteVideoTrack.value = track
-                    }
-                }
-
-                override fun onTrack(transceiver: RtpTransceiver?) {
-                    val track = transceiver?.receiver?.track() as? VideoTrack
-                    if (track != null) {
-                        _remoteVideoTrack.value = track
-                    }
-                }
-            }
-        ) ?: return
+            )
+        } catch (_: Throwable) {
+            null
+        } ?: return
 
         peerConnection = pc
 
-        // 1. Create the reliable ordered RTCDataChannel for all P2P Commands & File Transfers
-        val dcInit = DataChannel.Init().apply {
-            ordered = true
-        }
-        val dc = pc.createDataChannel("smart_home_p2p_channel", dcInit)
-        attachDataChannelObserver(dc)
+        try {
+            // 1. Create the reliable ordered RTCDataChannel for all P2P Commands & File Transfers
+            val dcInit = DataChannel.Init().apply {
+                ordered = true
+            }
+            val dc = pc.createDataChannel("smart_home_p2p_channel", dcInit)
+            attachDataChannelObserver(dc)
 
-        // 2. Add Video Transceiver so the same PeerConnection also carries the 30 FPS live screen stream
-        pc.addTransceiver(
-            MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO,
-            RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.RECV_ONLY)
-        )
+            // 2. Add Video Transceiver so the same PeerConnection also carries the live screen stream
+            pc.addTransceiver(
+                MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO,
+                RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.RECV_ONLY)
+            )
+        } catch (_: Throwable) {
+        }
+
+        val answerLock = Any()
 
         fun processAnswerAndServerCandidates(
             incomingSessionId: String,
@@ -314,46 +314,54 @@ class WebRtcP2pClientManager(
             if (incomingSessionId.isNotBlank() && incomingSessionId != sessionId) return
             val activePc = peerConnection ?: return
 
-            if (!isRemoteAnswerApplied && answerSdp.isNotBlank() && answerType.equals("answer", ignoreCase = true)) {
-                isRemoteAnswerApplied = true
-                val answerDesc = SessionDescription(SessionDescription.Type.ANSWER, answerSdp)
-                activePc.setRemoteDescription(
-                    object : SimpleSdpObserver() {
-                        override fun onSetSuccess() {
-                            _p2pConnectionStatus.value = "تم استلام SDP Answer • جاري فتح قناة البيانات P2P..."
-                        }
-                    },
-                    answerDesc
-                )
-            }
-
-            if (serverCandidatesJson.isNotBlank()) {
-                try {
-                    val arr = JSONArray(serverCandidatesJson)
-                    for (i in 0 until arr.length()) {
-                        val cObj = arr.getJSONObject(i)
-                        val sdp = cObj.optString("sdp")
-                        val sdpMid = cObj.optString("sdpMid")
-                        val sdpMLineIndex = cObj.optInt("sdpMLineIndex", 0)
-                        val key = "$sdpMid:$sdpMLineIndex:$sdp"
-                        if (sdp.isNotBlank() && addedServerCandidates.add(key)) {
-                            activePc.addIceCandidate(IceCandidate(sdpMid, sdpMLineIndex, sdp))
-                        }
+            synchronized(answerLock) {
+                if (!isRemoteAnswerApplied && answerSdp.isNotBlank() && answerType.equals("answer", ignoreCase = true)) {
+                    isRemoteAnswerApplied = true
+                    try {
+                        val answerDesc = SessionDescription(SessionDescription.Type.ANSWER, answerSdp)
+                        activePc.setRemoteDescription(
+                            object : SimpleSdpObserver() {
+                                override fun onSetSuccess() {
+                                    _p2pConnectionStatus.value = "تم استلام SDP Answer • جاري فتح قناة البيانات P2P..."
+                                }
+                            },
+                            answerDesc
+                        )
+                    } catch (_: Throwable) {
                     }
-                } catch (_: Exception) {
+                }
+
+                if (serverCandidatesJson.isNotBlank()) {
+                    try {
+                        val arr = JSONArray(serverCandidatesJson)
+                        for (i in 0 until arr.length()) {
+                            val cObj = arr.getJSONObject(i)
+                            val sdp = cObj.optString("sdp")
+                            val sdpMid = cObj.optString("sdpMid")
+                            val sdpMLineIndex = cObj.optInt("sdpMLineIndex", 0)
+                            val key = "$sdpMid:$sdpMLineIndex:$sdp"
+                            if (sdp.isNotBlank() && addedServerCandidates.add(key)) {
+                                activePc.addIceCandidate(IceCandidate(sdpMid, sdpMLineIndex, sdp))
+                            }
+                        }
+                    } catch (_: Throwable) {
+                    }
                 }
             }
         }
 
         // Listen via Firestore (`users/{uid}/signaling/main`)
-        firestoreSignalingRegistration = signalingDoc.addSnapshotListener { snapshot, error ->
-            if (error != null || snapshot == null || !snapshot.exists()) return@addSnapshotListener
-            processAnswerAndServerCandidates(
-                incomingSessionId = snapshot.getString("sessionId").orEmpty(),
-                answerSdp = snapshot.getString("answerSdp").orEmpty(),
-                answerType = snapshot.getString("answerType").orEmpty(),
-                serverCandidatesJson = snapshot.getString("serverCandidatesJson").orEmpty()
-            )
+        try {
+            firestoreSignalingRegistration = signalingDoc?.addSnapshotListener { snapshot, error ->
+                if (error != null || snapshot == null || !snapshot.exists()) return@addSnapshotListener
+                processAnswerAndServerCandidates(
+                    incomingSessionId = snapshot.getString("sessionId").orEmpty(),
+                    answerSdp = snapshot.getString("answerSdp").orEmpty(),
+                    answerType = snapshot.getString("answerType").orEmpty(),
+                    serverCandidatesJson = snapshot.getString("serverCandidatesJson").orEmpty()
+                )
+            }
+        } catch (_: Throwable) {
         }
 
         // Also listen via Firebase Realtime Database (`users/{uid}/signaling`)
@@ -373,73 +381,89 @@ class WebRtcP2pClientManager(
             rtdbSignalingListener = listener
             try {
                 rtdbRef.addValueEventListener(listener)
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
             }
         }
 
         // Create SDP Offer and publish to `users/{uid}/signaling`
-        val constraints = MediaConstraints().apply {
-            mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "true"))
-            mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"))
+        try {
+            val constraints = MediaConstraints().apply {
+                mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "true"))
+                mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"))
+            }
+            pc.createOffer(
+                object : SimpleSdpObserver() {
+                    override fun onCreateSuccess(desc: SessionDescription?) {
+                        if (desc == null) return
+                        try {
+                            pc.setLocalDescription(
+                                object : SimpleSdpObserver() {
+                                    override fun onSetSuccess() {
+                                        publishSignalingFields(
+                                            mapOf(
+                                                "userId" to userId,
+                                                "sessionId" to sessionId,
+                                                "offerSdp" to desc.description,
+                                                "offerType" to "offer",
+                                                "answerSdp" to "",
+                                                "answerType" to "",
+                                                "serverCandidatesJson" to "[]",
+                                                "adminCandidatesJson" to "[]",
+                                                "updatedAt" to System.currentTimeMillis()
+                                            )
+                                        )
+                                        _p2pConnectionStatus.value = "تم إرسال SDP Offer عبر السحابة • بانتظار رد هاتف المنزل..."
+                                    }
+                                },
+                                desc
+                            )
+                        } catch (_: Throwable) {
+                        }
+                    }
+                },
+                constraints
+            )
+        } catch (_: Throwable) {
         }
-        pc.createOffer(
-            object : SimpleSdpObserver() {
-                override fun onCreateSuccess(desc: SessionDescription?) {
-                    if (desc == null) return
-                    pc.setLocalDescription(
-                        object : SimpleSdpObserver() {
-                            override fun onSetSuccess() {
-                                publishSignalingFields(
-                                    mapOf(
-                                        "userId" to userId,
-                                        "sessionId" to sessionId,
-                                        "offerSdp" to desc.description,
-                                        "offerType" to "offer",
-                                        "answerSdp" to "",
-                                        "answerType" to "",
-                                        "serverCandidatesJson" to "[]",
-                                        "adminCandidatesJson" to "[]",
-                                        "updatedAt" to System.currentTimeMillis()
-                                    )
-                                )
-                                _p2pConnectionStatus.value = "تم إرسال SDP Offer عبر السحابة • بانتظار رد هاتف المنزل..."
-                            }
-                        },
-                        desc
-                    )
-                }
-            },
-            constraints
-        )
     }
 
     private fun attachDataChannelObserver(channel: DataChannel) {
         commandDataChannel = channel
-        channel.registerObserver(
-            object : DataChannel.Observer {
-                override fun onBufferedAmountChange(previousAmount: Long) {}
+        try {
+            channel.registerObserver(
+                object : DataChannel.Observer {
+                    override fun onBufferedAmountChange(previousAmount: Long) {}
 
-                override fun onStateChange() {
-                    val state = channel.state()
-                    if (state == DataChannel.State.OPEN) {
-                        _isP2pConnected.value = true
-                        _p2pConnectionStatus.value = "متصل عالمياً عبر WebRTC P2P (RTCDataChannel OPEN)"
-                    } else if (state == DataChannel.State.CLOSED) {
-                        _isP2pConnected.value = false
+                    override fun onStateChange() {
+                        val state = try {
+                            channel.state()
+                        } catch (_: Throwable) {
+                            return
+                        }
+                        if (state == DataChannel.State.OPEN) {
+                            _isP2pConnected.value = true
+                            _p2pConnectionStatus.value = "متصل عالمياً عبر WebRTC P2P (RTCDataChannel OPEN)"
+                        } else if (state == DataChannel.State.CLOSED) {
+                            _isP2pConnected.value = false
+                        }
+                    }
+
+                    override fun onMessage(buffer: DataChannel.Buffer?) {
+                        if (buffer == null) return
+                        try {
+                            val bytes = ByteArray(buffer.data.remaining())
+                            buffer.data.get(bytes)
+                            if (!buffer.binary) {
+                                val text = String(bytes, StandardCharsets.UTF_8)
+                                handleIncomingDataChannelJson(text)
+                            }
+                        } catch (_: Throwable) {
+                        }
                     }
                 }
-
-                override fun onMessage(buffer: DataChannel.Buffer?) {
-                    if (buffer == null) return
-                    val bytes = ByteArray(buffer.data.remaining())
-                    buffer.data.get(bytes)
-                    if (!buffer.binary) {
-                        val text = String(bytes, StandardCharsets.UTF_8)
-                        handleIncomingDataChannelJson(text)
-                    }
-                }
-            }
-        )
+            )
+        } catch (_: Throwable) {
+        }
     }
 
     private fun handleIncomingDataChannelJson(rawText: String) {
@@ -489,7 +513,7 @@ class WebRtcP2pClientManager(
                     try {
                         session.outputStream.flush()
                         session.outputStream.close()
-                    } catch (_: Exception) {
+                    } catch (_: Throwable) {
                     }
                     session.onProgress(TransferProgress(isActive = false))
                     session.completion.complete(session.outputFile)
@@ -499,7 +523,7 @@ class WebRtcP2pClientManager(
                     val session = activeDownloads.remove(reqId) ?: return
                     try {
                         session.outputStream.close()
-                    } catch (_: Exception) {
+                    } catch (_: Throwable) {
                     }
                     session.onProgress(TransferProgress(isActive = false))
                     session.completion.completeExceptionally(
@@ -513,7 +537,7 @@ class WebRtcP2pClientManager(
                     }
                 }
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
     }
 
@@ -528,7 +552,7 @@ class WebRtcP2pClientManager(
         timeoutMs: Long = 12_000L
     ): Result<JSONObject> = withContext(Dispatchers.IO) {
         val dc = commandDataChannel
-        if (dc == null || dc.state() != DataChannel.State.OPEN) {
+        if (dc == null || try { dc.state() != DataChannel.State.OPEN } catch (_: Throwable) { true }) {
             return@withContext Result.failure(
                 IllegalStateException("قناة WebRTC DataChannel غير متصلة حالياً — جاري التفاوض السحابي...")
             )
@@ -661,7 +685,7 @@ class WebRtcP2pClientManager(
         onProgress: (TransferProgress) -> Unit
     ): Result<File> = withContext(Dispatchers.IO) {
         val dc = commandDataChannel
-        if (dc == null || dc.state() != DataChannel.State.OPEN) {
+        if (dc == null || try { dc.state() != DataChannel.State.OPEN } catch (_: Throwable) { true }) {
             return@withContext Result.failure(
                 IllegalStateException("قناة WebRTC DataChannel غير متصلة حالياً")
             )
@@ -712,7 +736,7 @@ class WebRtcP2pClientManager(
             activeDownloads.remove(reqId)?.let {
                 try {
                     it.outputStream.close()
-                } catch (_: Exception) {
+                } catch (_: Throwable) {
                 }
             }
             onProgress(TransferProgress(isActive = false))
@@ -730,7 +754,7 @@ class WebRtcP2pClientManager(
         onProgress: (TransferProgress) -> Unit
     ): Result<String> = withContext(Dispatchers.IO) {
         val dc = commandDataChannel
-        if (dc == null || dc.state() != DataChannel.State.OPEN) {
+        if (dc == null || try { dc.state() != DataChannel.State.OPEN } catch (_: Throwable) { true }) {
             return@withContext Result.failure(
                 IllegalStateException("قناة WebRTC DataChannel غير متصلة حالياً")
             )
@@ -784,7 +808,7 @@ class WebRtcP2pClientManager(
 
                     // Respect DataChannel backpressure
                     var waitLoops = 0
-                    while (dc.bufferedAmount() > 1_048_576L && waitLoops < 100) {
+                    while (try { dc.bufferedAmount() > 1_048_576L } catch (_: Throwable) { false } && waitLoops < 100) {
                         kotlinx.coroutines.delay(25L)
                         waitLoops++
                     }
@@ -832,31 +856,38 @@ class WebRtcP2pClientManager(
         }
     }
 
+    @Synchronized
     private fun cleanupActiveConnectionOnly() {
-        firestoreSignalingRegistration?.remove()
+        try {
+            firestoreSignalingRegistration?.remove()
+        } catch (_: Throwable) {
+        }
         firestoreSignalingRegistration = null
         try {
             rtdbSignalingListener?.let { rtdbSignalingRef?.removeEventListener(it) }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
         rtdbSignalingListener = null
 
         try {
+            commandDataChannel?.unregisterObserver()
+        } catch (_: Throwable) {
+        }
+        try {
             commandDataChannel?.close()
-            commandDataChannel?.dispose()
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
         commandDataChannel = null
 
         try {
             peerConnection?.close()
-            peerConnection?.dispose()
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
         peerConnection = null
         _isP2pConnected.value = false
     }
 
+    @Synchronized
     fun disconnectAll() {
         cleanupActiveConnectionOnly()
         _remoteVideoTrack.value = null
@@ -874,10 +905,94 @@ class WebRtcP2pClientManager(
         @Volatile
         private var INSTANCE: WebRtcP2pClientManager? = null
 
+        @Volatile
+        private var sharedEglBase: EglBase? = null
+
+        @Volatile
+        private var sharedPeerConnectionFactory: PeerConnectionFactory? = null
+
+        @Volatile
+        private var isNativeRuntimeInitialized: Boolean = false
+
+        private val webRtcInitLock = Any()
+
         fun getInstance(context: Context): WebRtcP2pClientManager {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: WebRtcP2pClientManager(context.applicationContext).also {
                     INSTANCE = it
+                }
+            }
+        }
+
+        /**
+         * Returns a single process-wide shared EglBase instance safely, catching any Error/Throwable
+         * on older GPUs or emulators.
+         */
+        fun getSharedEglBase(): EglBase? {
+            sharedEglBase?.let { return it }
+            synchronized(webRtcInitLock) {
+                sharedEglBase?.let { return it }
+                val created = try {
+                    EglBase.create()
+                } catch (_: Throwable) {
+                    try {
+                        EglBase.create(null, EglBase.CONFIG_PLAIN)
+                    } catch (_: Throwable) {
+                        null
+                    }
+                }
+                sharedEglBase = created
+                return created
+            }
+        }
+
+        /**
+         * Initializes `PeerConnectionFactory` at most once per process and shares it safely between
+         * `HomeServerForegroundService` and `WebRtcP2pClientManager`.
+         */
+        fun getSharedPeerConnectionFactory(context: Context): PeerConnectionFactory? {
+            sharedPeerConnectionFactory?.let { return it }
+            synchronized(webRtcInitLock) {
+                sharedPeerConnectionFactory?.let { return it }
+                return try {
+                    val appCtx = context.applicationContext
+                    if (!isNativeRuntimeInitialized) {
+                        PeerConnectionFactory.initialize(
+                            PeerConnectionFactory.InitializationOptions.builder(appCtx)
+                                .setEnableInternalTracer(false)
+                                .createInitializationOptions()
+                        )
+                        isNativeRuntimeInitialized = true
+                    }
+
+                    val eglContext = getSharedEglBase()?.eglBaseContext
+                    val encoderFactory = try {
+                        if (eglContext != null) {
+                            DefaultVideoEncoderFactory(eglContext, true, false)
+                        } else {
+                            SoftwareVideoEncoderFactory()
+                        }
+                    } catch (_: Throwable) {
+                        SoftwareVideoEncoderFactory()
+                    }
+
+                    val decoderFactory = try {
+                        if (eglContext != null) {
+                            DefaultVideoDecoderFactory(eglContext)
+                        } else {
+                            SoftwareVideoDecoderFactory()
+                        }
+                    } catch (_: Throwable) {
+                        SoftwareVideoDecoderFactory()
+                    }
+
+                    PeerConnectionFactory.builder()
+                        .setVideoEncoderFactory(encoderFactory)
+                        .setVideoDecoderFactory(decoderFactory)
+                        .createPeerConnectionFactory()
+                        .also { sharedPeerConnectionFactory = it }
+                } catch (_: Throwable) {
+                    null
                 }
             }
         }

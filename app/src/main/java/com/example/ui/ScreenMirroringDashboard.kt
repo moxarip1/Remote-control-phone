@@ -554,10 +554,13 @@ fun ScreenMirroringDashboard(
                             AndroidView(
                                 factory = { ctx ->
                                     SurfaceViewRenderer(ctx).apply {
-                                        init(p2pManager.eglBase.eglBaseContext, null)
-                                        setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
-                                        setEnableHardwareScaler(true)
-                                        setMirror(false)
+                                        try {
+                                            init(p2pManager.eglBase?.eglBaseContext, null)
+                                            setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
+                                            setEnableHardwareScaler(true)
+                                            setMirror(false)
+                                        } catch (_: Throwable) {
+                                        }
                                         surfaceRendererRef = this
                                     }
                                 },
