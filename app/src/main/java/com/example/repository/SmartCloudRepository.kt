@@ -1,0 +1,637 @@
+package com.example.repository
+
+import android.app.Activity
+import android.content.Context
+import android.net.Uri
+import android.os.Environment
+import android.provider.OpenableColumns
+import android.util.Log
+import androidx.credentials.ClearCredentialStateRequest
+import androidx.credentials.CredentialManager
+import androidx.credentials.CustomCredential
+import androidx.credentials.GetCredentialRequest
+import androidx.credentials.exceptions.GetCredentialCancellationException
+import com.example.R
+import com.example.model.HomeNodeInfo
+import com.example.model.RemoteFileItem
+import com.example.model.TransferProgress
+import com.google.android.libraries.identity.googleid.GetGoogleIdOption
+import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
+import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
+import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential.Companion.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.FirebaseUser
+import com.google.firebase.auth.GoogleAuthProvider
+import com.google.firebase.database.FirebaseDatabase
+import com.google.firebase.firestore.DocumentSnapshot
+import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.FirebaseFirestoreException
+import com.google.firebase.firestore.snapshots
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody
+import okio.BufferedSink
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
+import java.net.URLEncoder
+import java.util.concurrent.TimeUnit
+
+enum class OperationType(val value: String) {
+    CREATE("create"),
+    UPDATE("update"),
+    DELETE("delete"),
+    LIST("list"),
+    GET("get"),
+    WRITE("write"),
+}
+
+fun handleFirestoreError(exception: Exception, operationType: OperationType, path: String?): String {
+    val auth = FirebaseAuth.getInstance()
+    val currentUser = auth.currentUser
+
+    val providerInfoList = currentUser?.providerData?.map { provider ->
+        JSONObject().apply {
+            put("providerId", provider.providerId)
+            put("email", provider.email)
+        }
+    } ?: emptyList()
+
+    val authInfoJson = JSONObject().apply {
+        put("userId", currentUser?.uid)
+        put("email", currentUser?.email)
+        put("emailVerified", currentUser?.isEmailVerified)
+        put("tenantId", currentUser?.tenantId)
+        put("providerInfo", JSONArray(providerInfoList))
+    }
+
+    val errorInfoJson = JSONObject().apply {
+        put("error", exception.message ?: exception.toString())
+        put("operationType", operationType.value)
+        put("path", path)
+        put("authInfo", authInfoJson)
+    }
+
+    val jsonString = errorInfoJson.toString()
+    Log.e("FirestoreError", "Firestore Error: $jsonString")
+    return jsonString
+}
+
+class SmartCloudRepository(
+    private val firestore: FirebaseFirestore,
+    private val auth: FirebaseAuth = FirebaseAuth.getInstance()
+) {
+    constructor(context: Context) : this(
+        FirebaseFirestore.getInstance(
+            context.applicationContext.getString(R.string.firestore_database_id)
+        ),
+        FirebaseAuth.getInstance()
+    )
+
+    private val httpClient: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
+        .build()
+
+    val currentUser: FirebaseUser?
+        get() = auth.currentUser
+
+    fun requireUserId(): String {
+        return auth.currentUser?.uid
+            ?: throw IllegalStateException("User must be signed in before accessing Smart Home Cloud.")
+    }
+
+    fun observeAuthState(): Flow<FirebaseUser?> = callbackFlow {
+        val listener = FirebaseAuth.AuthStateListener { firebaseAuth ->
+            trySend(firebaseAuth.currentUser)
+        }
+        auth.addAuthStateListener(listener)
+        awaitClose { auth.removeAuthStateListener(listener) }
+    }
+
+    /**
+     * Silent auto sign-in via Jetpack Credential Manager using GetGoogleIdOption.
+     */
+    suspend fun attemptAutoSignIn(context: Context): Result<FirebaseUser> {
+        auth.currentUser?.let { return Result.success(it) }
+        val clientId = try {
+            context.getString(R.string.default_web_client_id)
+        } catch (e: Exception) {
+            return Result.failure(e)
+        }
+
+        val googleIdOption = GetGoogleIdOption.Builder()
+            .setFilterByAuthorizedAccounts(true)
+            .setServerClientId(clientId)
+            .setAutoSelectEnabled(true)
+            .build()
+
+        val request = GetCredentialRequest.Builder()
+            .addCredentialOption(googleIdOption)
+            .build()
+
+        return try {
+            val credentialManager = CredentialManager.create(context)
+            val result = credentialManager.getCredential(context, request)
+            val credential = result.credential
+            if (credential is CustomCredential && credential.type == TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
+                val googleIdToken = GoogleIdTokenCredential.createFrom(credential.data).idToken
+                val authCredential = GoogleAuthProvider.getCredential(googleIdToken, null)
+                val authResult = auth.signInWithCredential(authCredential).await()
+                val user = checkNotNull(authResult.user) { "Authenticated user is null" }
+                Result.success(user)
+            } else {
+                Result.failure(IllegalStateException("Unexpected credential type"))
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Interactive Google Sign-In via Jetpack Credential Manager using GetSignInWithGoogleOption.
+     */
+    suspend fun signInWithGoogleInteractive(
+        activity: Activity,
+        onCancelled: () -> Unit = {}
+    ): Result<FirebaseUser> {
+        val clientId = try {
+            activity.getString(R.string.default_web_client_id)
+        } catch (e: Exception) {
+            return Result.failure(IllegalStateException("default_web_client_id missing", e))
+        }
+
+        val signInOption = GetSignInWithGoogleOption.Builder(serverClientId = clientId).build()
+        val request = GetCredentialRequest.Builder()
+            .addCredentialOption(signInOption)
+            .build()
+
+        return try {
+            val credentialManager = CredentialManager.create(activity)
+            val result = credentialManager.getCredential(activity, request)
+            val credential = result.credential
+            if (credential is CustomCredential && credential.type == TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
+                val googleIdToken = GoogleIdTokenCredential.createFrom(credential.data).idToken
+                val authCredential = GoogleAuthProvider.getCredential(googleIdToken, null)
+                val authResult = auth.signInWithCredential(authCredential).await()
+                val user = checkNotNull(authResult.user) { "Authenticated user is null" }
+                Result.success(user)
+            } else {
+                Result.failure(IllegalStateException("Unexpected credential type"))
+            }
+        } catch (e: GetCredentialCancellationException) {
+            Log.w(TAG, "Google Sign-In cancelled or dismissed: ${e.message}", e)
+            onCancelled()
+            Result.failure(e)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Google Sign-In failed", e)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun signOut(context: Context) {
+        auth.signOut()
+        try {
+            val credentialManager = CredentialManager.create(context)
+            credentialManager.clearCredentialState(ClearCredentialStateRequest())
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to clear CredentialManager state", e)
+        }
+    }
+
+    /**
+     * Publishes HomeNodeInfo to `/users/{uid}/home_node/main` in Firestore Enterprise
+     * AND mirrors to Realtime Database `users/{uid}/home_node` with `onDisconnect()` hook if configured.
+     */
+    suspend fun publishHomeNodeInfo(
+        nodeInfo: HomeNodeInfo,
+        registerOnDisconnect: Boolean = true
+    ): Result<Unit> {
+        val uid = try {
+            requireUserId()
+        } catch (e: Exception) {
+            return Result.failure(e)
+        }
+
+        val docRef = firestore.collection("users").document(uid)
+            .collection("home_node").document("main")
+
+        return try {
+            try {
+                docRef.update(nodeInfo.toFirestoreUpdateMap()).await()
+            } catch (notFound: FirebaseFirestoreException) {
+                if (notFound.code == FirebaseFirestoreException.Code.NOT_FOUND) {
+                    docRef.set(nodeInfo.toFirestoreCreateMap(uid)).await()
+                } else {
+                    throw notFound
+                }
+            }
+
+            // Mirror to Firebase Realtime Database with onDisconnect() when RTDB is available
+            mirrorToRealtimeDatabaseSafely(uid, nodeInfo, registerOnDisconnect)
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.WRITE, docRef.path)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun markHomeNodeOffline(lastNodeInfo: HomeNodeInfo): Result<Unit> {
+        return publishHomeNodeInfo(
+            lastNodeInfo.copy(isOnline = false, lastUpdated = System.currentTimeMillis()),
+            registerOnDisconnect = false
+        )
+    }
+
+    suspend fun getHomeNodeInfo(userId: String = requireUserId()): Result<HomeNodeInfo?> {
+        val docRef = firestore.collection("users").document(userId)
+            .collection("home_node").document("main")
+        return try {
+            val snapshot = docRef.get().await()
+            if (!snapshot.exists()) {
+                Result.success(null)
+            } else {
+                Result.success(
+                    snapshot.toObject(
+                        HomeNodeInfo::class.java,
+                        DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
+                    )
+                )
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.GET, docRef.path)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Real-time observation of `/users/{userId}/home_node/main` for Admin Controller auto-discovery.
+     */
+    fun observeHomeNode(userId: String = requireUserId()): Flow<HomeNodeInfo?> {
+        val docRef = firestore.collection("users").document(userId)
+            .collection("home_node").document("main")
+        return docRef.snapshots()
+            .map { snapshot ->
+                if (snapshot.exists()) {
+                    snapshot.toObject(
+                        HomeNodeInfo::class.java,
+                        DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
+                    )
+                } else {
+                    null
+                }
+            }
+            .catch { error ->
+                if (error is Exception) {
+                    handleFirestoreError(error, OperationType.GET, docRef.path)
+                }
+                throw error
+            }
+    }
+
+    private fun mirrorToRealtimeDatabaseSafely(
+        uid: String,
+        nodeInfo: HomeNodeInfo,
+        registerOnDisconnect: Boolean
+    ) {
+        try {
+            val rtdbRef = FirebaseDatabase.getInstance()
+                .getReference("users")
+                .child(uid)
+                .child("home_node")
+            if (registerOnDisconnect) {
+                rtdbRef.onDisconnect().updateChildren(mapOf("isOnline" to false))
+            }
+            rtdbRef.setValue(nodeInfo.toRealtimeDbMap())
+        } catch (_: Exception) {
+            // Realtime Database URL may not be configured in google-services.json when Firestore Enterprise is primary
+        }
+    }
+
+    // =========================================================================
+    // ADMIN CONTROLLER REMOTE HTTP OPERATIONS (NanoHTTPD Client with x-auth-token)
+    // =========================================================================
+
+    suspend fun pingHomeNodeStatus(node: HomeNodeInfo): Result<HomeNodeInfo> = withContext(Dispatchers.IO) {
+        try {
+            val url = "${node.baseUrl()}/status"
+            val request = Request.Builder()
+                .url(url)
+                .header("x-auth-token", node.secretToken)
+                .get()
+                .build()
+
+            httpClient.newCall(request).execute().use { response ->
+                val bodyStr = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(
+                        IllegalStateException("HTTP ${response.code}: $bodyStr")
+                    )
+                }
+                val json = JSONObject(bodyStr)
+                val updated = node.copy(
+                    isOnline = true,
+                    batteryLevel = json.optInt("batteryLevel", node.batteryLevel),
+                    freeStorageBytes = json.optLong("freeStorageBytes", node.freeStorageBytes),
+                    totalStorageBytes = json.optLong("totalStorageBytes", node.totalStorageBytes),
+                    lastUpdated = json.optLong("timestamp", System.currentTimeMillis())
+                )
+                Result.success(updated)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    data class RemoteDirectoryListing(
+        val currentPath: String,
+        val parentPath: String,
+        val rootPath: String,
+        val items: List<RemoteFileItem>
+    )
+
+    suspend fun listRemoteFiles(
+        node: HomeNodeInfo,
+        dirPath: String = ""
+    ): Result<RemoteDirectoryListing> = withContext(Dispatchers.IO) {
+        try {
+            val encodedPath = URLEncoder.encode(dirPath, "UTF-8")
+            val url = "${node.baseUrl()}/files?path=$encodedPath"
+            val request = Request.Builder()
+                .url(url)
+                .header("x-auth-token", node.secretToken)
+                .get()
+                .build()
+
+            httpClient.newCall(request).execute().use { response ->
+                val bodyStr = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(
+                        IllegalStateException("HTTP ${response.code}: $bodyStr")
+                    )
+                }
+                val json = JSONObject(bodyStr)
+                val currentPath = json.optString("currentPath", dirPath)
+                val parentPath = json.optString("parentPath", "")
+                val rootPath = json.optString("rootPath", currentPath)
+                val filesJson = json.optJSONArray("files") ?: JSONArray()
+
+                val items = buildList {
+                    for (i in 0 until filesJson.length()) {
+                        val obj = filesJson.getJSONObject(i)
+                        add(
+                            RemoteFileItem(
+                                name = obj.optString("name"),
+                                path = obj.optString("path"),
+                                isDirectory = obj.optBoolean("isDirectory", false),
+                                sizeBytes = obj.optLong("sizeBytes", 0L),
+                                lastModified = obj.optLong("lastModified", 0L)
+                            )
+                        )
+                    }
+                }
+                Result.success(
+                    RemoteDirectoryListing(
+                        currentPath = currentPath,
+                        parentPath = parentPath,
+                        rootPath = rootPath,
+                        items = items
+                    )
+                )
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun downloadRemoteFile(
+        context: Context,
+        node: HomeNodeInfo,
+        fileItem: RemoteFileItem,
+        onProgress: (TransferProgress) -> Unit
+    ): Result<File> = withContext(Dispatchers.IO) {
+        try {
+            val encodedPath = URLEncoder.encode(fileItem.path, "UTF-8")
+            val url = "${node.baseUrl()}/download?path=$encodedPath"
+            val request = Request.Builder()
+                .url(url)
+                .header("x-auth-token", node.secretToken)
+                .get()
+                .build()
+
+            httpClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(
+                        IllegalStateException("فشل التحميل (HTTP ${response.code})")
+                    )
+                }
+
+                val body = response.body
+                    ?: return@withContext Result.failure(IllegalStateException("Empty response body"))
+
+                val totalBytes = response.header("Content-Length")?.toLongOrNull()
+                    ?: body.contentLength().takeIf { it > 0 }
+                    ?: fileItem.sizeBytes
+
+                val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                    ?.takeIf { it.exists() || it.mkdirs() }
+                    ?: context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                    ?: context.filesDir
+
+                val destFile = File(downloadsDir, fileItem.name)
+                var transferred = 0L
+                val buffer = ByteArray(64 * 1024)
+
+                onProgress(
+                    TransferProgress(
+                        isActive = true,
+                        fileName = fileItem.name,
+                        isUpload = false,
+                        bytesTransferred = 0L,
+                        totalBytes = totalBytes,
+                        statusMessage = "جاري سحب الملف من الخادم المنزلي..."
+                    )
+                )
+
+                body.byteStream().use { input ->
+                    FileOutputStream(destFile).use { output ->
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read <= 0) break
+                            output.write(buffer, 0, read)
+                            transferred += read
+                            onProgress(
+                                TransferProgress(
+                                    isActive = true,
+                                    fileName = fileItem.name,
+                                    isUpload = false,
+                                    bytesTransferred = transferred,
+                                    totalBytes = totalBytes,
+                                    statusMessage = "جاري التحميل: ${RemoteFileItem.formatBytes(transferred)} / ${RemoteFileItem.formatBytes(totalBytes)}"
+                                )
+                            )
+                        }
+                        output.flush()
+                    }
+                }
+
+                onProgress(TransferProgress(isActive = false))
+                Result.success(destFile)
+            }
+        } catch (e: CancellationException) {
+            onProgress(TransferProgress(isActive = false))
+            throw e
+        } catch (e: Exception) {
+            onProgress(TransferProgress(isActive = false))
+            Result.failure(e)
+        }
+    }
+
+    suspend fun uploadFileToHomeNode(
+        context: Context,
+        node: HomeNodeInfo,
+        targetDirPath: String,
+        fileUri: Uri,
+        onProgress: (TransferProgress) -> Unit
+    ): Result<String> = withContext(Dispatchers.IO) {
+        try {
+            val contentResolver = context.contentResolver
+            var displayName = "uploaded_${System.currentTimeMillis()}"
+            var fileSize = -1L
+
+            contentResolver.query(fileUri, null, null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    if (nameIdx != -1) {
+                        displayName = cursor.getString(nameIdx) ?: displayName
+                    }
+                    if (sizeIdx != -1 && !cursor.isNull(sizeIdx)) {
+                        fileSize = cursor.getLong(sizeIdx)
+                    }
+                }
+            }
+
+            val encodedDir = URLEncoder.encode(targetDirPath, "UTF-8")
+            val encodedName = URLEncoder.encode(displayName, "UTF-8")
+            val url = "${node.baseUrl()}/upload?path=$encodedDir&filename=$encodedName"
+
+            val streamingBody = object : RequestBody() {
+                override fun contentType() = "application/octet-stream".toMediaTypeOrNull()
+
+                override fun contentLength(): Long = fileSize
+
+                override fun writeTo(sink: BufferedSink) {
+                    val inputStream = contentResolver.openInputStream(fileUri)
+                        ?: throw IllegalStateException("تعذر فتح الملف المختار للرفع")
+                    val buffer = ByteArray(64 * 1024)
+                    var uploaded = 0L
+
+                    inputStream.use { input ->
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read <= 0) break
+                            sink.write(buffer, 0, read)
+                            uploaded += read
+                            onProgress(
+                                TransferProgress(
+                                    isActive = true,
+                                    fileName = displayName,
+                                    isUpload = true,
+                                    bytesTransferred = uploaded,
+                                    totalBytes = fileSize.coerceAtLeast(uploaded),
+                                    statusMessage = "جاري الرفع: ${RemoteFileItem.formatBytes(uploaded)}"
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+
+            val request = Request.Builder()
+                .url(url)
+                .header("x-auth-token", node.secretToken)
+                .post(streamingBody)
+                .build()
+
+            httpClient.newCall(request).execute().use { response ->
+                onProgress(TransferProgress(isActive = false))
+                val bodyStr = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(
+                        IllegalStateException("فشل رفع الملف (HTTP ${response.code}): $bodyStr")
+                    )
+                }
+                Result.success(displayName)
+            }
+        } catch (e: CancellationException) {
+            onProgress(TransferProgress(isActive = false))
+            throw e
+        } catch (e: Exception) {
+            onProgress(TransferProgress(isActive = false))
+            Result.failure(e)
+        }
+    }
+
+    suspend fun deleteRemoteFile(
+        node: HomeNodeInfo,
+        targetPath: String
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            val encodedPath = URLEncoder.encode(targetPath, "UTF-8")
+            val url = "${node.baseUrl()}/delete?path=$encodedPath"
+            val request = Request.Builder()
+                .url(url)
+                .header("x-auth-token", node.secretToken)
+                .delete()
+                .build()
+
+            httpClient.newCall(request).execute().use { response ->
+                val bodyStr = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(
+                        IllegalStateException("فشل الحذف (HTTP ${response.code}): $bodyStr")
+                    )
+                }
+                Result.success(Unit)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    fun buildStreamUrl(node: HomeNodeInfo, fileItem: RemoteFileItem): String {
+        val encodedPath = URLEncoder.encode(fileItem.path, "UTF-8")
+        return "${node.baseUrl()}/stream?path=$encodedPath"
+    }
+
+    private companion object {
+        const val TAG = "SmartCloudRepository"
+    }
+}

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Outer subtle glow ring -->
+    <path
+        android:fillColor="#1A38BDF8"
+        android:pathData="M54,54m-32,0a32,32 0,1 1,64 0a32,32 0,1 1,-64 0" />
+    <!-- Bold Cloud Silhouette -->
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M70.5,48.2C68.9,39.6 61.4,33 52.3,33c-7.2,0 -13.5,4.1 -16.5,10.2C29.7,44.1 25,49.4 25,55.8C25,62.8 30.7,68.5 37.7,68.5h32.3c5.8,0 10.5,-4.7 10.5,-10.5C80.5,52.8 76.1,48.6 70.5,48.2z" />
+    <!-- Smart Home Roof & Node Core Cutout inside Cloud -->
+    <path
+        android:fillColor="#0A192F"
+        android:pathData="M54,44L41,54.5h3.8v10h18.4v-10H67L54,44z" />
+    <!-- Server Status Indicator LEDs -->
+    <path
+        android:fillColor="#4ADE80"
+        android:pathData="M48,57h12v2.5h-12z" />
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M48,61h8v2.5h-8z" />
+</vector>

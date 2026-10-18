@@ -1,0 +1,13 @@
+{
+  "rules": {
+    "users": {
+      "$uid": {
+        "home_node": {
+          ".read": "auth != null && auth.uid === $uid",
+          ".write": "auth != null && auth.uid === $uid",
+          ".validate": "newData.hasChildren(['deviceName', 'ipAddress', 'port', 'isOnline', 'secretToken', 'batteryLevel', 'freeStorageBytes', 'totalStorageBytes', 'lastUpdated']) && newData.child('deviceName').isString() && newData.child('deviceName').val().length <= 120 && newData.child('ipAddress').isString() && newData.child('ipAddress').val().length <= 64 && newData.child('port').isNumber() && newData.child('port').val() >= 1024 && newData.child('port').val() <= 65535 && newData.child('isOnline').isBoolean() && newData.child('secretToken').isString() && newData.child('secretToken').val().length <= 128 && newData.child('batteryLevel').isNumber() && newData.child('batteryLevel').val() >= 0 && newData.child('batteryLevel').val() <= 100 && newData.child('freeStorageBytes').isNumber() && newData.child('freeStorageBytes').val() >= 0 && newData.child('totalStorageBytes').isNumber() && newData.child('totalStorageBytes').val() >= 0 && newData.child('lastUpdated').isNumber()"
+        }
+      }
+    }
+  }
+}

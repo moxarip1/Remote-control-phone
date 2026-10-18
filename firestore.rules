@@ -1,0 +1,89 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net: Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidHomeNode(data) {
+      return data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 128 &&
+             data.userId == request.auth.uid &&
+             data.deviceName is string && data.deviceName.size() >= 1 && data.deviceName.size() <= 120 &&
+             data.ipAddress is string && data.ipAddress.size() <= 64 &&
+             data.port is int && data.port >= 1024 && data.port <= 65535 &&
+             data.isOnline is bool &&
+             data.secretToken is string && data.secretToken.size() <= 128 &&
+             data.batteryLevel is int && data.batteryLevel >= 0 && data.batteryLevel <= 100 &&
+             data.freeStorageBytes is int && data.freeStorageBytes >= 0 &&
+             data.totalStorageBytes is int && data.totalStorageBytes >= 0 &&
+             data.lastUpdated is int && data.lastUpdated >= 0 &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    match /users/{userId}/home_node/{nodeId} {
+      allow get: if isSignedIn() &&
+                    isValidId(userId) &&
+                    isValidId(nodeId) &&
+                    request.auth.uid == userId;
+
+      allow list: if isSignedIn() &&
+                     request.auth.uid == userId &&
+                     resource.data.userId == request.auth.uid;
+
+      allow create: if isSignedIn() &&
+                       isValidId(userId) &&
+                       isValidId(nodeId) &&
+                       request.auth.uid == userId &&
+                       incoming().keys().hasAll([
+                         'userId', 'deviceName', 'ipAddress', 'port', 'isOnline',
+                         'secretToken', 'batteryLevel', 'freeStorageBytes',
+                         'totalStorageBytes', 'lastUpdated', 'createdAt', 'updatedAt'
+                       ]) &&
+                       incoming().keys().hasOnly([
+                         'userId', 'deviceName', 'ipAddress', 'port', 'isOnline',
+                         'secretToken', 'batteryLevel', 'freeStorageBytes',
+                         'totalStorageBytes', 'lastUpdated', 'createdAt', 'updatedAt'
+                       ]) &&
+                       isValidHomeNode(incoming());
+
+      allow update: if isSignedIn() &&
+                       isValidHomeNode(incoming()) &&
+                       isValidId(userId) &&
+                       isValidId(nodeId) &&
+                       request.auth.uid == userId &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       (
+                         // Action 1: Full Telemetry & Discovery Sync
+                         incoming().diff(existing()).affectedKeys().hasOnly([
+                           'deviceName', 'ipAddress', 'port', 'isOnline',
+                           'secretToken', 'batteryLevel', 'freeStorageBytes',
+                           'totalStorageBytes', 'lastUpdated', 'updatedAt'
+                         ])
+                       );
+
+      allow delete: if isSignedIn() &&
+                       isValidId(userId) &&
+                       isValidId(nodeId) &&
+                       request.auth.uid == userId;
+    }
+  }
+}

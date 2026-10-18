@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">Smart Home Cloud</string>
+    <string name="notification_channel_name">خادم السحابة المنزلية الذكية</string>
+    <string name="notification_channel_desc">إشعار تشغيل الخادم المنزلي ومزامنة الشبكة في الخلفية</string>
+    <string name="server_running_title">الخادم المنزلي نشط (Home Node Online)</string>
+    <string name="stop_server_action">إيقاف الخادم</string>
+</resources>

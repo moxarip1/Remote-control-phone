@@ -1,0 +1,83 @@
+{
+  "entities": {
+    "HomeNodeInfo": {
+      "title": "HomeNodeInfo",
+      "description": "Represents the real-time signaling, telemetry, and discovery state of a user's Home Node Server.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "UID of the authenticated user who owns this Home Node."
+        },
+        "deviceName": {
+          "type": "string",
+          "description": "Human-readable model and manufacturer name of the Home Node phone."
+        },
+        "ipAddress": {
+          "type": "string",
+          "description": "Local IPv4 address of the Home Node on the Wi-Fi LAN."
+        },
+        "port": {
+          "type": "integer",
+          "description": "Port number where NanoHTTPD local file and media streaming server listens."
+        },
+        "isOnline": {
+          "type": "boolean",
+          "description": "Whether the Home Node HTTP server is currently online and reachable."
+        },
+        "secretToken": {
+          "type": "string",
+          "description": "Random session UUID token required in x-auth-token header for all HTTP requests."
+        },
+        "batteryLevel": {
+          "type": "integer",
+          "description": "Current battery percentage (0-100) of the Home Node phone."
+        },
+        "freeStorageBytes": {
+          "type": "integer",
+          "description": "Available free storage bytes on the Home Node device."
+        },
+        "totalStorageBytes": {
+          "type": "integer",
+          "description": "Total storage capacity in bytes on the Home Node device."
+        },
+        "lastUpdated": {
+          "type": "integer",
+          "description": "Epoch milliseconds of the last status heartbeat."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the Home Node record was first initialized (FieldValue.serverTimestamp())."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the latest signaling update (FieldValue.serverTimestamp())."
+        }
+      },
+      "required": [
+        "userId",
+        "deviceName",
+        "ipAddress",
+        "port",
+        "isOnline",
+        "secretToken",
+        "batteryLevel",
+        "freeStorageBytes",
+        "totalStorageBytes",
+        "lastUpdated",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/home_node/{nodeId}": {
+      "schema": {
+        "$ref": "#/entities/HomeNodeInfo"
+      },
+      "description": "Per-user Home Node signaling and discovery state document (e.g., nodeId = 'main')."
+    }
+  }
+}
