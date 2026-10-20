@@ -105,6 +105,7 @@ fun ScreenMirroringDashboard(
     val p2pManager = remember { WebRtcP2pClientManager.getInstance(context) }
 
     val isP2pConnected by p2pManager.isP2pConnected.collectAsStateWithLifecycle()
+    val p2pRealtimeState by p2pManager.p2pRealtimeState.collectAsStateWithLifecycle()
     val p2pConnectionStatus by p2pManager.p2pConnectionStatus.collectAsStateWithLifecycle()
     val remoteVideoTrack by p2pManager.remoteVideoTrack.collectAsStateWithLifecycle()
 
@@ -286,8 +287,23 @@ fun ScreenMirroringDashboard(
                     .fillMaxSize()
                     .padding(innerPadding)
                     .padding(horizontal = 14.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
+                WebRtcRealtimeStatusBanner(
+                    realtimeState = p2pRealtimeState,
+                    detailMessage = p2pConnectionStatus,
+                    onRetryClick = {
+                        if (discoveredNode != null) {
+                            val uid = FirebaseAuth.getInstance().currentUser?.uid ?: discoveredNode.userId
+                            p2pManager.connectToHomeNodeP2p(
+                                userId = uid,
+                                secretToken = discoveredNode.secretToken,
+                                forceReconnect = true
+                            )
+                        }
+                    }
+                )
+
                 // =====================================================================
                 // 1. TOP SECTION: Screenshot Polling Mode (/screenshot @ 1000ms over RTCDataChannel)
                 // =====================================================================

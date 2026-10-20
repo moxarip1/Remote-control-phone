@@ -158,6 +158,13 @@ fun SmartHomeCloudRootApp(
         viewModel.tryAutoSignIn(context)
     }
 
+    // Automatically ensure the Home Node Server is running whenever signed in
+    LaunchedEffect(currentUser?.uid, selectedMode, isServerRunning) {
+        if (currentUser != null) {
+            viewModel.ensureHomeServerAlwaysRunning(context)
+        }
+    }
+
     if (currentUser == null) {
         AuthScreen(
             isLoading = isAuthLoading,
@@ -235,8 +242,7 @@ fun SmartHomeCloudRootApp(
                     statusMessage = statusBanner,
                     isMediaProjectionEnabled = isMediaProjectionEnabled,
                     webRtcStateText = webRtcStateText,
-                    onStartServer = { viewModel.startHomeServerService(context) },
-                    onStopServer = { viewModel.stopHomeServerService(context) },
+                    onStartServer = { viewModel.startHomeServerService(context, silent = true) },
                     onRequestMediaProjection = {
                         val mpm = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? MediaProjectionManager
                         if (mpm != null) {

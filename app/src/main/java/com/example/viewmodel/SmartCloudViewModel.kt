@@ -19,6 +19,7 @@ import com.example.model.HomeNodeInfo
 import com.example.model.RemoteFileItem
 import com.example.model.ServerLog
 import com.example.model.TransferProgress
+import com.example.receiver.BootCompletedReceiver
 import com.example.repository.SmartCloudRepository
 import com.example.server.LocalFileServer
 import com.example.service.HomeServerForegroundService
@@ -31,11 +32,13 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 class SmartCloudViewModel(
     private val repository: SmartCloudRepository,
-    private val p2pClientManager: WebRtcP2pClientManager? = null
+    private val p2pClientManager: WebRtcP2pClientManager? = null,
+    private val appContext: Context? = null
 ) : ViewModel() {
 
     private val _currentUser = MutableStateFlow<FirebaseUser?>(repository.currentUser)
@@ -96,6 +99,7 @@ class SmartCloudViewModel(
 
     private var nodeListenerJob: Job? = null
     private var p2pStateWatcherJob: Job? = null
+    private var alwaysOnServerWatchdogJob: Job? = null
     private var lastAutoLoadedNodeKey: String? = null
 
     init {
@@ -106,12 +110,25 @@ class SmartCloudViewModel(
                     _currentUser.value = user
                     if (user != null) {
                         startObservingHomeNode(user.uid)
+                        appContext?.let { ensureHomeServerAlwaysRunning(it) }
                     } else {
                         stopObservingHomeNode()
                         p2pClientManager?.disconnectAll()
                         _selectedMode.value = AppMode.NONE
                     }
                 }
+        }
+
+        // Always-On Server Watchdog: keeps HomeServerForegroundService running automatically and continuously
+        if (appContext != null) {
+            alwaysOnServerWatchdogJob = viewModelScope.launch {
+                while (isActive) {
+                    if (_currentUser.value != null && !isServerRunning.value) {
+                        ensureHomeServerAlwaysRunning(appContext)
+                    }
+                    delay(4_000L)
+                }
+            }
         }
 
         // Automatically reload directory & status over RTCDataChannel as soon as P2P tunnel transitions to OPEN
@@ -293,14 +310,37 @@ class SmartCloudViewModel(
         _selectedMode.value = mode
         _errorBannerMessage.value = null
         _statusBannerMessage.value = null
+        val localDeviceName = "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}".trim()
+
         when (mode) {
             AppMode.HOME_NODE_SERVER -> {
-                // Ensure Admin P2P client is idle on this device so it never collides with the local Home Node Server
+                // Persist role as Home Server and ensure Admin P2P client does not collide locally
+                saveDeviceRole(BootCompletedReceiver.ROLE_HOME_SERVER)
                 p2pClientManager?.disconnectAll()
+                if (appContext != null && !isServerRunning.value) {
+                    startHomeServerService(appContext, silent = true)
+                }
             }
             AppMode.ADMIN_CONTROLLER, AppMode.SCREEN_MIRRORING -> {
                 val node = _discoveredHomeNode.value
                 val uid = _currentUser.value?.uid.orEmpty()
+                val isAnotherRemoteDeviceOnline = node != null &&
+                    node.isOnline &&
+                    node.deviceName.isNotBlank() &&
+                    !node.deviceName.equals(localDeviceName, ignoreCase = true)
+
+                if (isAnotherRemoteDeviceOnline) {
+                    // When controlling a different remote Home Phone, mark this phone as Admin
+                    // and stop any local server so it never overwrites the remote Home Phone's signaling.
+                    saveDeviceRole(BootCompletedReceiver.ROLE_ADMIN_ONLY)
+                    if (isServerRunning.value && appContext != null) {
+                        stopHomeServerService(appContext)
+                    }
+                } else if (appContext != null && !isServerRunning.value) {
+                    // Single-device testing: ensure local server is running automatically
+                    startHomeServerService(appContext, silent = true)
+                }
+
                 if (node != null && node.isOnline) {
                     p2pClientManager?.connectToHomeNodeP2p(
                         userId = uid.ifBlank { node.userId },
@@ -311,7 +351,65 @@ class SmartCloudViewModel(
                     }
                 }
             }
-            AppMode.NONE -> {}
+            AppMode.NONE -> {
+                if (appContext != null) {
+                    ensureHomeServerAlwaysRunning(appContext)
+                }
+            }
+        }
+    }
+
+    private fun saveDeviceRole(role: String) {
+        try {
+            appContext?.getSharedPreferences(BootCompletedReceiver.PREFS_NAME, Context.MODE_PRIVATE)
+                ?.edit()
+                ?.putString(BootCompletedReceiver.KEY_DEVICE_ROLE, role)
+                ?.apply()
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun readSavedDeviceRole(context: Context): String {
+        return try {
+            context.applicationContext
+                .getSharedPreferences(BootCompletedReceiver.PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(BootCompletedReceiver.KEY_DEVICE_ROLE, BootCompletedReceiver.ROLE_HOME_SERVER)
+                ?: BootCompletedReceiver.ROLE_HOME_SERVER
+        } catch (_: Throwable) {
+            BootCompletedReceiver.ROLE_HOME_SERVER
+        }
+    }
+
+    fun ensureHomeServerAlwaysRunning(context: Context) {
+        if (_currentUser.value == null) return
+        if (isServerRunning.value) return
+
+        val mode = _selectedMode.value
+        if (mode == AppMode.HOME_NODE_SERVER) {
+            startHomeServerService(context, silent = true)
+            return
+        }
+
+        val localDeviceName = "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}".trim()
+        val remoteNode = _discoveredHomeNode.value
+        val isAnotherRemoteDeviceOnline = remoteNode != null &&
+            remoteNode.isOnline &&
+            remoteNode.deviceName.isNotBlank() &&
+            !remoteNode.deviceName.equals(localDeviceName, ignoreCase = true) &&
+            (System.currentTimeMillis() - remoteNode.lastUpdated) < 90_000L
+
+        if (mode == AppMode.ADMIN_CONTROLLER || mode == AppMode.SCREEN_MIRRORING) {
+            if (!isAnotherRemoteDeviceOnline) {
+                startHomeServerService(context, silent = true)
+            }
+            return
+        }
+
+        // On ModeSelector (AppMode.NONE): auto-start unless another remote Home Phone is actively online
+        // and this phone was used as an Admin Controller.
+        val savedRole = readSavedDeviceRole(context)
+        if (!isAnotherRemoteDeviceOnline || savedRole == BootCompletedReceiver.ROLE_HOME_SERVER) {
+            startHomeServerService(context, silent = true)
         }
     }
 
@@ -321,15 +419,20 @@ class SmartCloudViewModel(
     }
 
     // =========================================================================
-    // HOME NODE SERVER CONTROLS (With Optional Notification Permission Support)
+    // HOME NODE SERVER CONTROLS (Always-On Automatic Server + Optional Notifications)
     // =========================================================================
 
-    fun startHomeServerService(context: Context, port: Int = LocalFileServer.DEFAULT_PORT) {
-        // Ensure any local Admin P2P client is disconnected before starting the Home Node Server
-        p2pClientManager?.disconnectAll()
+    fun startHomeServerService(
+        context: Context,
+        port: Int = LocalFileServer.DEFAULT_PORT,
+        silent: Boolean = false
+    ) {
+        if (_selectedMode.value == AppMode.HOME_NODE_SERVER) {
+            p2pClientManager?.disconnectAll()
+        }
 
-        val appContext = context.applicationContext
-        val intent = Intent(appContext, HomeServerForegroundService::class.java).apply {
+        val appCtx = context.applicationContext
+        val intent = Intent(appCtx, HomeServerForegroundService::class.java).apply {
             action = HomeServerForegroundService.ACTION_START_SERVER
             putExtra(HomeServerForegroundService.EXTRA_PORT, port)
         }
@@ -337,13 +440,13 @@ class SmartCloudViewModel(
         val hasNotifPermission = try {
             val runtimeGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 ContextCompat.checkSelfPermission(
-                    appContext,
+                    appCtx,
                     Manifest.permission.POST_NOTIFICATIONS
                 ) == PackageManager.PERMISSION_GRANTED
             } else {
                 true
             }
-            runtimeGranted && NotificationManagerCompat.from(appContext).areNotificationsEnabled()
+            runtimeGranted && NotificationManagerCompat.from(appCtx).areNotificationsEnabled()
         } catch (_: Throwable) {
             false
         }
@@ -352,22 +455,26 @@ class SmartCloudViewModel(
             // Always prefer startService() when launched from foreground UI so the OS never arms
             // a fatal ForegroundServiceDidNotStartInTimeException timer if notifications are denied/restricted.
             // HomeServerForegroundService still promotes itself via startForeground() inside onStartCommand.
-            appContext.startService(intent)
+            appCtx.startService(intent)
         } catch (_: Throwable) {
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && hasNotifPermission) {
-                    appContext.startForegroundService(intent)
+                    appCtx.startForegroundService(intent)
                 }
             } catch (e: Throwable) {
-                _errorBannerMessage.value = "تعذر تشغيل الخادم: ${e.localizedMessage}"
+                if (!silent) {
+                    _errorBannerMessage.value = "تعذر تشغيل الخادم: ${e.localizedMessage}"
+                }
                 return
             }
         }
 
-        _statusBannerMessage.value = if (hasNotifPermission) {
-            "تم بدء تشغيل الخادم المنزلي (WebRTC P2P)"
-        } else {
-            "تم بدء تشغيل الخادم المنزلي في الوضع الصامت (بدون إشعارات)"
+        if (!silent) {
+            _statusBannerMessage.value = if (hasNotifPermission) {
+                "الخادم المنزلي يعمل تلقائياً ودائماً (WebRTC P2P)"
+            } else {
+                "الخادم المنزلي يعمل تلقائياً ودائماً في الوضع الصامت (بدون إشعارات)"
+            }
         }
     }
 
@@ -598,7 +705,7 @@ class SmartCloudViewModel(
                 val firestore = FirebaseFirestore.getInstance(databaseId)
                 val repository = SmartCloudRepository(firestore)
                 val p2pManager = WebRtcP2pClientManager.getInstance(appContext)
-                return SmartCloudViewModel(repository, p2pManager) as T
+                return SmartCloudViewModel(repository, p2pManager, appContext) as T
             }
         }
     }

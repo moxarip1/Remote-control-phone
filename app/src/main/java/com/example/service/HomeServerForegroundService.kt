@@ -139,6 +139,7 @@ class HomeServerForegroundService : Service() {
     private val addedRemoteCandidateKeys = mutableSetOf<String>()
     private val pendingAdminCandidates = mutableListOf<IceCandidate>()
     private var isRemoteOfferSet: Boolean = false
+    private var isAnswerPublished: Boolean = false
     private val localServerCandidatesArray = JSONArray()
     private var lastHandledOfferKey: String? = null
     private var currentP2pSessionId: String = ""
@@ -700,6 +701,14 @@ class HomeServerForegroundService : Service() {
         ) {
             if (!_isRunning.value) return
 
+            // If signaling node was cleaned/deleted before a new Offer, reset offer tracking immediately
+            if (offerSdp.isBlank()) {
+                synchronized(webRtcLock) {
+                    lastHandledOfferKey = null
+                }
+                return
+            }
+
             // Handle fresh SDP Offer from Admin Controller
             if (offerSdp.isNotBlank() && offerType.equals("offer", ignoreCase = true)) {
                 val offerKey = "${sessionId.ifBlank { "default" }}:${offerSdp.hashCode()}"
@@ -735,7 +744,13 @@ class HomeServerForegroundService : Service() {
         try {
             firestoreSignalingRegistration?.remove()
             firestoreSignalingRegistration = signalingDoc?.addSnapshotListener { snapshot, error ->
-                if (error != null || snapshot == null || !snapshot.exists()) return@addSnapshotListener
+                if (error != null || snapshot == null) return@addSnapshotListener
+                if (!snapshot.exists()) {
+                    synchronized(webRtcLock) {
+                        lastHandledOfferKey = null
+                    }
+                    return@addSnapshotListener
+                }
                 onSignalingPayload(
                     sessionId = snapshot.getString("sessionId").orEmpty(),
                     offerSdp = snapshot.getString("offerSdp").orEmpty(),
@@ -749,7 +764,13 @@ class HomeServerForegroundService : Service() {
         try {
             legacyFirestoreSignalingRegistration?.remove()
             legacyFirestoreSignalingRegistration = legacySignalingDoc?.addSnapshotListener { snapshot, error ->
-                if (error != null || snapshot == null || !snapshot.exists()) return@addSnapshotListener
+                if (error != null || snapshot == null) return@addSnapshotListener
+                if (!snapshot.exists()) {
+                    synchronized(webRtcLock) {
+                        lastHandledOfferKey = null
+                    }
+                    return@addSnapshotListener
+                }
                 onSignalingPayload(
                     sessionId = snapshot.getString("sessionId").orEmpty(),
                     offerSdp = snapshot.getString("offerSdp").orEmpty(),
@@ -768,6 +789,12 @@ class HomeServerForegroundService : Service() {
             rtdbSignalingRef = ref
             val listener = object : ValueEventListener {
                 override fun onDataChange(snapshot: DataSnapshot) {
+                    if (!snapshot.exists()) {
+                        synchronized(webRtcLock) {
+                            lastHandledOfferKey = null
+                        }
+                        return
+                    }
                     onSignalingPayload(
                         sessionId = snapshot.child("sessionId").getValue(String::class.java).orEmpty(),
                         offerSdp = snapshot.child("offerSdp").getValue(String::class.java).orEmpty(),
@@ -790,6 +817,7 @@ class HomeServerForegroundService : Service() {
 
             isPeerSessionActive = false
             isRemoteOfferSet = false
+            isAnswerPublished = false
 
             try {
                 activeDataChannel?.unregisterObserver()
@@ -815,14 +843,8 @@ class HomeServerForegroundService : Service() {
                 }
             }
 
-            // Configure Google STUN Servers in PeerConnection.RTCConfiguration for NAT traversal
-            val iceServers = listOf(
-                PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
-                PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer(),
-                PeerConnection.IceServer.builder("stun:stun2.l.google.com:19302").createIceServer(),
-                PeerConnection.IceServer.builder("stun:stun3.l.google.com:19302").createIceServer(),
-                PeerConnection.IceServer.builder("stun:stun4.l.google.com:19302").createIceServer()
-            )
+            // Configure Google STUN + OpenRelay Public TURN Servers in PeerConnection.RTCConfiguration
+            val iceServers = WebRtcP2pClientManager.getInstance(applicationContext).buildPublicStunTurnIceServers()
             val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
                 sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
                 continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
@@ -843,22 +865,23 @@ class HomeServerForegroundService : Service() {
                                 PeerConnection.IceConnectionState.CONNECTED,
                                 PeerConnection.IceConnectionState.COMPLETED -> {
                                     isPeerSessionActive = true
-                                    "متصل عالمياً عبر P2P (ICE CONNECTED)"
+                                    "الحالة اللحظية: open • متصل عالمياً عبر P2P (ICE CONNECTED)"
                                 }
+                                PeerConnection.IceConnectionState.NEW,
                                 PeerConnection.IceConnectionState.CHECKING -> {
                                     isPeerSessionActive = true
-                                    "جاري عبور NAT عبر Google STUN (ICE CHECKING)..."
+                                    "الحالة اللحظية: connecting • جاري فحص مسارات STUN/TURN (ICE CHECKING)..."
                                 }
                                 PeerConnection.IceConnectionState.DISCONNECTED -> {
                                     isPeerSessionActive = false
-                                    "انقطع اتصال P2P مؤقتاً"
+                                    "الحالة اللحظية: connecting • انقطع اتصال P2P مؤقتاً..."
                                 }
                                 PeerConnection.IceConnectionState.FAILED,
                                 PeerConnection.IceConnectionState.CLOSED -> {
                                     isPeerSessionActive = false
-                                    "بانتظار اتصال P2P جديد"
+                                    "الحالة اللحظية: failed • تعذر مسار ICE وبانتظار تفاوض جديد"
                                 }
-                                else -> "WebRTC P2P: ${newState?.name ?: "STANDBY"}"
+                                else -> "الحالة اللحظية: connecting • WebRTC P2P (${newState?.name ?: "STANDBY"})"
                             }
                             _webRtcStateText.value = stateLabel
                             appendLog(
@@ -877,6 +900,8 @@ class HomeServerForegroundService : Service() {
 
                         override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState?) {
                             if (newState == PeerConnection.IceGatheringState.COMPLETE) {
+                                val canPublish = synchronized(webRtcLock) { isAnswerPublished }
+                                if (!canPublish) return
                                 val serialized = synchronized(localServerCandidatesArray) {
                                     localServerCandidatesArray.toString()
                                 }
@@ -903,6 +928,9 @@ class HomeServerForegroundService : Service() {
                                 localServerCandidatesArray.put(candidateObj)
                                 localServerCandidatesArray.toString()
                             }
+                            val canPublish = synchronized(webRtcLock) { isAnswerPublished }
+                            if (!canPublish) return
+
                             val fields = mutableMapOf<String, Any>(
                                 "userId" to uid,
                                 "serverCandidatesJson" to serialized,
@@ -961,17 +989,18 @@ class HomeServerForegroundService : Service() {
         offerSdp: String,
         initialAdminCandidatesJson: String = ""
     ) {
+        _webRtcStateText.value = "الحالة اللحظية: connecting • جاري معالجة Offer وإعداد STUN/TURN..."
         appendLog(
             ServerLog(
                 method = "WEBRTC-P2P",
                 endpoint = "users/$uid/signaling",
-                message = "تم استلام SDP Offer من الآدمن — جاري تهيئة Google STUN وإرسال SDP Answer..."
+                message = "تم استلام SDP Offer من الآدمن — جاري تهيئة STUN/TURN وإرسال SDP Answer..."
             )
         )
 
         val pc = buildPeerConnection(uid, sessionId) ?: return
 
-        // Pre-queue any Admin ICE candidates that arrived together with the Offer
+        // Pre-queue any Admin ICE candidates that arrived together with the Offer in Candidate Queue
         if (initialAdminCandidatesJson.isNotBlank() && initialAdminCandidatesJson != "[]") {
             processIncomingAdminCandidates(initialAdminCandidatesJson)
         }
@@ -981,7 +1010,7 @@ class HomeServerForegroundService : Service() {
             pc.setRemoteDescription(
                 object : SimpleSdpObserver() {
                     override fun onSetSuccess() {
-                        // Now that remote description is set, flush all queued Admin ICE candidates!
+                        // Flush the Candidate Queue ONLY after setRemoteDescription succeeds!
                         synchronized(webRtcLock) {
                             isRemoteOfferSet = true
                             val queued = pendingAdminCandidates.toList()
@@ -995,10 +1024,7 @@ class HomeServerForegroundService : Service() {
                         }
 
                         try {
-                            val constraints = MediaConstraints().apply {
-                                mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
-                                mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"))
-                            }
+                            val constraints = MediaConstraints()
                             pc.createAnswer(
                                 object : SimpleSdpObserver() {
                                     override fun onCreateSuccess(desc: SessionDescription?) {
@@ -1010,6 +1036,9 @@ class HomeServerForegroundService : Service() {
                                                         isPeerSessionActive = true
                                                         val currentServerCandidates = synchronized(localServerCandidatesArray) {
                                                             localServerCandidatesArray.toString()
+                                                        }
+                                                        synchronized(webRtcLock) {
+                                                            isAnswerPublished = true
                                                         }
                                                         val fields = mutableMapOf<String, Any>(
                                                             "userId" to uid,
@@ -1026,7 +1055,7 @@ class HomeServerForegroundService : Service() {
                                                             ServerLog(
                                                                 method = "WEBRTC-P2P",
                                                                 endpoint = "users/$uid/signaling",
-                                                                message = "تم إرسال SDP Answer ومرشحات STUN عبر السحابة بنجاح"
+                                                                message = "تم إرسال SDP Answer ومرشحات STUN/TURN عبر السحابة بنجاح"
                                                             )
                                                         )
                                                     }
@@ -1056,12 +1085,21 @@ class HomeServerForegroundService : Service() {
     private fun registerServerDataChannel(channel: DataChannel) {
         activeDataChannel = channel
         try {
-            if (channel.state() == DataChannel.State.OPEN) {
-                isPeerSessionActive = true
-                _webRtcStateText.value = "متصل عالمياً عبر P2P (RTCDataChannel نشط)"
-                serviceScope.launch {
-                    syncNodeStateWithCloud(isOnline = _isRunning.value)
+            when (channel.state()) {
+                DataChannel.State.CONNECTING -> {
+                    _webRtcStateText.value = "الحالة اللحظية: connecting • جاري فتح قناة البيانات (${channel.label()})..."
                 }
+                DataChannel.State.OPEN -> {
+                    isPeerSessionActive = true
+                    _webRtcStateText.value = "الحالة اللحظية: open • قناة البيانات (${channel.label()}) مفتوحة ونشطة"
+                    serviceScope.launch {
+                        syncNodeStateWithCloud(isOnline = _isRunning.value)
+                    }
+                }
+                DataChannel.State.CLOSED -> {
+                    _webRtcStateText.value = "الحالة اللحظية: failed • تم إغلاق قناة البيانات"
+                }
+                else -> {}
             }
         } catch (_: Throwable) {
         }
@@ -1077,24 +1115,34 @@ class HomeServerForegroundService : Service() {
                         } catch (_: Throwable) {
                             return
                         }
-                        if (state == DataChannel.State.OPEN) {
-                            isPeerSessionActive = true
-                            _webRtcStateText.value = "متصل عالمياً عبر P2P (RTCDataChannel نشط)"
-                            appendLog(
-                                ServerLog(
-                                    method = "DATACHANNEL",
-                                    endpoint = channel.label(),
-                                    message = "تم فتح قناة البيانات المباشرة RTCDataChannel بنجاح مع هاتف الآدمن"
+                        when (state) {
+                            DataChannel.State.CONNECTING -> {
+                                _webRtcStateText.value =
+                                    "الحالة اللحظية: connecting • جاري فتح قناة البيانات (${channel.label()})..."
+                            }
+                            DataChannel.State.OPEN -> {
+                                isPeerSessionActive = true
+                                _webRtcStateText.value =
+                                    "الحالة اللحظية: open • قناة البيانات (${channel.label()}) مفتوحة ونشطة"
+                                appendLog(
+                                    ServerLog(
+                                        method = "DATACHANNEL",
+                                        endpoint = channel.label(),
+                                        message = "الحالة اللحظية: open • تم فتح قناة البيانات المباشرة (${channel.label()}) بنجاح مع هاتف الآدمن"
+                                    )
                                 )
-                            )
-                            serviceScope.launch {
-                                syncNodeStateWithCloud(isOnline = _isRunning.value)
+                                serviceScope.launch {
+                                    syncNodeStateWithCloud(isOnline = _isRunning.value)
+                                }
                             }
-                        } else if (state == DataChannel.State.CLOSED) {
-                            _webRtcStateText.value = "بانتظار اتصال P2P جديد"
-                            serviceScope.launch {
-                                syncNodeStateWithCloud(isOnline = _isRunning.value)
+                            DataChannel.State.CLOSED -> {
+                                _webRtcStateText.value =
+                                    "الحالة اللحظية: failed • تم إغلاق قناة البيانات (${channel.label()})"
+                                serviceScope.launch {
+                                    syncNodeStateWithCloud(isOnline = _isRunning.value)
+                                }
                             }
+                            else -> {}
                         }
                     }
 
@@ -1590,6 +1638,9 @@ class HomeServerForegroundService : Service() {
         heartbeatJob?.cancel()
         heartbeatJob = serviceScope.launch {
             while (isActive && _isRunning.value) {
+                if (firestoreSignalingRegistration == null && rtdbOfferListener == null) {
+                    initializeWebRtcServerSignaling()
+                }
                 syncNodeStateWithCloud(isOnline = true)
                 delay(HEARTBEAT_INTERVAL_MS)
             }
@@ -1869,6 +1920,21 @@ class HomeServerForegroundService : Service() {
         }
     }
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        // Always keep the Home Node Server running even if the user swipes the Activity away from Recent Apps
+        if (_isRunning.value) {
+            try {
+                val restartIntent = Intent(applicationContext, HomeServerForegroundService::class.java).apply {
+                    action = ACTION_START_SERVER
+                    putExtra(EXTRA_PORT, activePort)
+                }
+                applicationContext.startService(restartIntent)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
     override fun onDestroy() {
         if (_isRunning.value) {
             stopServerAndSelf()
@@ -1926,29 +1992,14 @@ class HomeServerForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val stopIntent = Intent(this, HomeServerForegroundService::class.java).apply {
-            action = ACTION_STOP_SERVER
-        }
-        val stopPendingIntent = PendingIntent.getService(
-            this,
-            1,
-            stopIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
         // Use monochrome vector icon R.drawable.ic_stat_cloud_server (never AdaptiveIconDrawable)
         // to prevent StatusBarManagerService RemoteServiceException on Android 8-16.
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_cloud_server)
             .setContentTitle(getString(R.string.server_running_title))
-            .setContentText("متاح عالمياً عبر WebRTC P2P ($signalingPath)")
+            .setContentText("يعمل تلقائياً ودائماً عبر WebRTC P2P ($signalingPath)")
             .setOngoing(true)
             .setContentIntent(openPendingIntent)
-            .addAction(
-                android.R.drawable.ic_media_pause,
-                getString(R.string.stop_server_action),
-                stopPendingIntent
-            )
             .build()
     }
 

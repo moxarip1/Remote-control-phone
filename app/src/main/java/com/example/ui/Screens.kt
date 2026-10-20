@@ -92,6 +92,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -873,12 +874,12 @@ fun ModeSelectorScreen(
 
                 // Card 1: Home Node Server Mode
                 ModeSelectionCard(
-                    title = "Home Node Server Mode (Global WebRTC P2P)",
+                    title = "Home Node Server Mode (Always-On WebRTC P2P)",
                     arabicTitle = "نمط الخادم المنزلي (الهاتف القديم)",
-                    description = "تحويل هذا الهاتف إلى خادم سحابي منزلي يعمل عبر نفق WebRTC P2P وقناة RTCDataChannel مع مزامنة الإشارات عبر users/{uid}/signaling للوصول من أي شبكة في العالم.",
+                    description = "يعمل هذا الهاتف تلقائياً ودائماً كخادم سحابي منزلي عبر نفق WebRTC P2P وقناة RTCDataChannel مع مزامنة الإشارات عبر users/{uid}/signaling للوصول من أي شبكة في العالم.",
                     icon = Icons.Default.Dns,
-                    badgeText = if (isLocalServerRunning) "الخادم يعمل الآن (WebRTC P2P)" else "جاهز للتشغيل",
-                    badgePositive = isLocalServerRunning,
+                    badgeText = "يعمل تلقائياً ودائماً (WebRTC P2P)",
+                    badgePositive = true,
                     accentColor = MaterialTheme.colorScheme.primary,
                     testTag = "select_home_server_mode_card",
                     onClick = { onSelectMode(AppMode.HOME_NODE_SERVER) }
@@ -1084,7 +1085,7 @@ private fun ModeSelectionCard(
 }
 
 // =============================================================================
-// 3. HOME NODE SERVER SCREEN (Local HTTP Server + Live Console Logs)
+// 3. HOME NODE SERVER SCREEN (Always-On Automatic Server + Live Console Logs)
 // =============================================================================
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -1096,13 +1097,20 @@ fun HomeNodeServerScreen(
     statusMessage: String?,
     isMediaProjectionEnabled: Boolean = false,
     webRtcStateText: String = "",
-    onStartServer: () -> Unit,
-    onStopServer: () -> Unit,
+    onStartServer: () -> Unit = {},
+    onStopServer: () -> Unit = {},
     onRequestMediaProjection: () -> Unit = {},
     onClearLogs: () -> Unit,
     onBackToModeSelector: () -> Unit
 ) {
     BackHandler(onBack = onBackToModeSelector)
+
+    // Automatically ensure the server is started and kept running whenever this screen is active
+    LaunchedEffect(isRunning) {
+        if (!isRunning) {
+            onStartServer()
+        }
+    }
 
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
         Scaffold(
@@ -1117,9 +1125,9 @@ fun HomeNodeServerScreen(
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = if (isRunning) "متصل ومزامن مع Firebase" else "متوقف حالياً",
+                                text = "يعمل تلقائياً ودائماً • متصل ومزامن مع Firebase",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = if (isRunning) Color(0xFF10B981) else MaterialTheme.colorScheme.onSurfaceVariant
+                                color = Color(0xFF10B981)
                             )
                         }
                     },
@@ -1159,7 +1167,7 @@ fun HomeNodeServerScreen(
                     .padding(horizontal = 16.dp, vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                // Server Status & Telemetry Card
+                // Server Status & Telemetry Card (Always-On Automatic Mode)
                 ElevatedCard(
                     shape = RoundedCornerShape(22.dp),
                     modifier = Modifier.fillMaxWidth()
@@ -1180,38 +1188,40 @@ fun HomeNodeServerScreen(
                                     modifier = Modifier
                                         .size(14.dp)
                                         .clip(CircleShape)
-                                        .background(if (isRunning) Color(0xFF10B981) else Color(0xFFEF4444))
+                                        .background(Color(0xFF10B981))
                                 )
                                 Spacer(modifier = Modifier.width(10.dp))
                                 Text(
-                                    text = if (isRunning) "ONLINE • الخادم نشط" else "OFFLINE • الخادم متوقف",
+                                    text = "ONLINE • يعمل تلقائياً ودائماً",
                                     style = MaterialTheme.typography.titleMedium,
                                     fontWeight = FontWeight.ExtraBold,
-                                    color = if (isRunning) Color(0xFF10B981) else Color(0xFFEF4444)
+                                    color = Color(0xFF10B981)
                                 )
                             }
 
-                            Button(
-                                onClick = if (isRunning) onStopServer else onStartServer,
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = if (isRunning) {
-                                        MaterialTheme.colorScheme.error
-                                    } else {
-                                        MaterialTheme.colorScheme.primary
-                                    }
-                                ),
-                                shape = RoundedCornerShape(14.dp),
-                                modifier = Modifier.testTag("toggle_server_button")
+                            Surface(
+                                shape = RoundedCornerShape(50),
+                                color = Color(0xFF10B981).copy(alpha = 0.16f),
+                                modifier = Modifier.testTag("always_on_server_badge")
                             ) {
-                                Icon(
-                                    imageVector = if (isRunning) Icons.Default.Stop else Icons.Default.PowerSettingsNew,
-                                    contentDescription = null
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = if (isRunning) "إيقاف الخادم" else "تشغيل الخادم",
-                                    fontWeight = FontWeight.Bold
-                                )
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.CloudDone,
+                                        contentDescription = null,
+                                        tint = Color(0xFF10B981),
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "نشط دائماً 24/7",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = Color(0xFF10B981),
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
                             }
                         }
 
@@ -1224,11 +1234,7 @@ fun HomeNodeServerScreen(
                             TelemetryStatChip(
                                 icon = Icons.Default.Router,
                                 label = "مسار الإشارات العالمي (P2P)",
-                                value = if (nodeInfo != null && isRunning) {
-                                    "متاح عالمياً عبر P2P"
-                                } else {
-                                    "غير نشط"
-                                },
+                                value = "متاح عالمياً عبر P2P",
                                 modifier = Modifier.weight(1f)
                             )
                             TelemetryStatChip(
@@ -1331,6 +1337,22 @@ fun HomeNodeServerScreen(
                     }
                 }
 
+                // Real-Time WebRTC State Notification Banner (connecting, open, failed)
+                val serverRealtimeState = when {
+                    webRtcStateText.contains("open", ignoreCase = true) ||
+                        webRtcStateText.contains("CONNECTED", ignoreCase = true) ||
+                        webRtcStateText.contains("نشط", ignoreCase = true) -> "open"
+                    webRtcStateText.contains("failed", ignoreCase = true) ||
+                        webRtcStateText.contains("تعذر", ignoreCase = true) -> "failed"
+                    else -> "connecting"
+                }
+                WebRtcRealtimeStatusBanner(
+                    realtimeState = serverRealtimeState,
+                    detailMessage = webRtcStateText.ifBlank {
+                        "الحالة اللحظية: connecting • بانتظار اتصال الآدمن عبر STUN/TURN..."
+                    }
+                )
+
                 // Live Console Logs Header
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1372,7 +1394,7 @@ fun HomeNodeServerScreen(
                             contentAlignment = Alignment.Center
                         ) {
                             Text(
-                                text = "لا توجد أحداث مسجلة بعد. اضغط على «تشغيل الخادم» لبدء الاستماع للطلبات.",
+                                text = "يعمل الخادم المنزلي تلقائياً ودائماً في الخلفية وبانتظار الطلبات الواردة عبر نفق WebRTC P2P...",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = Color(0xFF64748B),
                                 textAlign = TextAlign.Center,
@@ -1392,6 +1414,100 @@ fun HomeNodeServerScreen(
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun WebRtcRealtimeStatusBanner(
+    realtimeState: String,
+    detailMessage: String,
+    onRetryClick: (() -> Unit)? = null
+) {
+    val normalizedState = when {
+        realtimeState.equals("open", ignoreCase = true) -> "open"
+        realtimeState.equals("failed", ignoreCase = true) -> "failed"
+        else -> "connecting"
+    }
+    val badgeColor = when (normalizedState) {
+        "open" -> Color(0xFF10B981)
+        "failed" -> Color(0xFFEF4444)
+        else -> Color(0xFFF59E0B)
+    }
+    val stateIcon = when (normalizedState) {
+        "open" -> Icons.Default.CloudDone
+        "failed" -> Icons.Default.CloudOff
+        else -> Icons.Default.Cloud
+    }
+
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = badgeColor.copy(alpha = 0.14f),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("webrtc_realtime_status_banner")
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.weight(1f)
+            ) {
+                if (normalizedState == "connecting") {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        color = badgeColor,
+                        strokeWidth = 2.dp
+                    )
+                } else {
+                    Icon(
+                        imageVector = stateIcon,
+                        contentDescription = normalizedState,
+                        tint = badgeColor,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Surface(
+                    shape = RoundedCornerShape(6.dp),
+                    color = badgeColor.copy(alpha = 0.22f)
+                ) {
+                    Text(
+                        text = normalizedState.uppercase(),
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = badgeColor,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                    )
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = detailMessage,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            if (onRetryClick != null && normalizedState != "open") {
+                IconButton(
+                    onClick = onRetryClick,
+                    modifier = Modifier.size(32.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = "إعادة التفاوض",
+                        tint = badgeColor,
+                        modifier = Modifier.size(18.dp)
+                    )
                 }
             }
         }
@@ -1638,6 +1754,24 @@ fun AdminControllerScreen(
                 HomeNodeDiscoveryHeaderCard(
                     node = discoveredNode,
                     onOpenScreenMirroring = onOpenScreenMirroring
+                )
+
+                // 1b. Real-Time WebRTC & DataChannel State Notification Bar (connecting, open, failed)
+                val adminRealtimeState = when {
+                    isP2pConnected || p2pConnectionStatus.contains("open", ignoreCase = true) -> "open"
+                    p2pConnectionStatus.contains("failed", ignoreCase = true) -> "failed"
+                    else -> "connecting"
+                }
+                WebRtcRealtimeStatusBanner(
+                    realtimeState = adminRealtimeState,
+                    detailMessage = p2pConnectionStatus.ifBlank {
+                        if (isP2pConnected) {
+                            "الحالة اللحظية: open • قناة البيانات (dataChannel) مفتوحة ونشطة"
+                        } else {
+                            "الحالة اللحظية: connecting • جاري التفاوض السحابي عبر STUN/TURN..."
+                        }
+                    },
+                    onRetryClick = onRefreshConnection
                 )
 
                 // 2. Active Transfer Progress Indicator (Download / Upload)
@@ -2246,7 +2380,7 @@ private fun OfflineHomeNodePlaceholder() {
             )
             Spacer(modifier = Modifier.height(6.dp))
             Text(
-                text = "افتح التطبيق على هاتف المنزل بنفس الحساب، واختر «نمط الخادم المنزلي» واضغط على تشغيل الخادم ليظهر هنا فوراً وبشكل تلقائي.",
+                text = "افتح التطبيق على هاتف المنزل بنفس الحساب؛ سيعمل الخادم المنزلي تلقائياً ودائماً ويظهر هنا فوراً.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center

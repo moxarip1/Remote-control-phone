@@ -1,8 +1,8 @@
 Application: Smart Home Cloud v2.0 (Single APK)
 Version: 2.0 (versionCode = 2)
-Updated At (Epoch ms): 1792348322946
-Selected Source APK: /app/applet/app/build/outputs/apk/debug/app-debug.apk (27123653 bytes)
-Output debug/debug.apk Size: 27123653 bytes
+Updated At (Epoch ms): 1792523423346
+Selected Source APK: /app/applet/app/build/outputs/apk/debug/app-debug.apk (26186347 bytes)
+Output debug/debug.apk Size: 26186347 bytes
 Included Updates:
 - Fixed WebRTC STUN NAT traversal (Google STUN servers) & ICE candidate queuing until setRemoteDescription completes so RTCDataChannel opens reliably
 - Fixed SurfaceViewRenderer 0xffffffff resource ID lookup via XML layout inflation
