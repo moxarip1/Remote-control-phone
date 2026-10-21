@@ -10,6 +10,7 @@ import com.example.R
 import com.example.model.HomeNodeInfo
 import com.example.model.RemoteFileItem
 import com.example.model.TransferProgress
+import com.example.repository.AuthTokenManager
 import com.example.repository.SmartCloudRepository.RemoteDirectoryListing
 import com.google.android.gms.tasks.Tasks
 import com.google.firebase.database.DataSnapshot
@@ -856,6 +857,27 @@ class WebRtcP2pClientManager private constructor(
     // UNIFIED P2P DATACHANNEL COMMANDS (/status, /files, /download, /upload, /screenshot, /delete)
     // =========================================================================
 
+    fun updateAuthToken(token: String) {
+        activeSecretToken = token.trim()
+    }
+
+    private fun resolveEffectiveToken(explicitToken: String = ""): String {
+        val candidate = explicitToken.trim()
+            .ifBlank { AuthTokenManager.getSavedAuthToken(appContext) }
+            .ifBlank { activeSecretToken.trim() }
+        if (candidate.isNotBlank()) {
+            activeSecretToken = candidate
+        }
+        return candidate
+    }
+
+    private fun buildHeadersJson(authToken: String): JSONObject {
+        return JSONObject().apply {
+            put("Content-Type", "application/json")
+            put("x-auth-token", authToken)
+        }
+    }
+
     private suspend fun ensureDataChannelReady(
         timeoutMs: Long = 8_000L
     ): DataChannel? {
@@ -884,8 +906,16 @@ class WebRtcP2pClientManager private constructor(
     private suspend fun sendJsonCommandOverDataChannel(
         action: String,
         extraFields: JSONObject = JSONObject(),
+        authToken: String = "",
         timeoutMs: Long = 10_000L
     ): Result<JSONObject> = withContext(Dispatchers.IO) {
+        val resolvedToken = resolveEffectiveToken(authToken)
+        if (resolvedToken.isBlank()) {
+            return@withContext Result.failure(
+                IllegalStateException("يرجى إدخال رمز المصادقة (x-auth-token) أولاً قبل إرسال الطلبات")
+            )
+        }
+
         val dc = ensureDataChannelReady(timeoutMs = 6_000L)
             ?: return@withContext Result.failure(
                 IllegalStateException("جاري التفاوض السحابي عبر WebRTC P2P (STUN/TURN)...")
@@ -900,7 +930,9 @@ class WebRtcP2pClientManager private constructor(
             }
             put("reqId", reqId)
             put("action", action)
-            put("token", activeSecretToken)
+            put("headers", buildHeadersJson(resolvedToken))
+            put("x-auth-token", resolvedToken)
+            put("token", resolvedToken)
         }
 
         val deferred = CompletableDeferred<JSONObject>()
@@ -940,11 +972,24 @@ class WebRtcP2pClientManager private constructor(
         }
     }
 
-    suspend fun requestNodeStatusP2p(node: HomeNodeInfo): Result<HomeNodeInfo> {
-        if (node.userId.isNotBlank()) {
-            connectToHomeNodeP2p(node.userId, node.secretToken, forceReconnect = false)
+    suspend fun requestNodeStatusP2p(
+        node: HomeNodeInfo,
+        authToken: String = ""
+    ): Result<HomeNodeInfo> {
+        val resolvedToken = resolveEffectiveToken(authToken.ifBlank { node.secretToken })
+        if (resolvedToken.isBlank()) {
+            return Result.failure(
+                IllegalStateException("يرجى إدخال رمز المصادقة (x-auth-token) أولاً قبل إرسال الطلبات")
+            )
         }
-        return sendJsonCommandOverDataChannel(action = "/status", timeoutMs = 8_000L).map { res ->
+        if (node.userId.isNotBlank()) {
+            connectToHomeNodeP2p(node.userId, resolvedToken, forceReconnect = false)
+        }
+        return sendJsonCommandOverDataChannel(
+            action = "/status",
+            authToken = resolvedToken,
+            timeoutMs = 8_000L
+        ).map { res ->
             node.copy(
                 isOnline = true,
                 p2pState = "P2P_CONNECTED",
@@ -957,14 +1002,22 @@ class WebRtcP2pClientManager private constructor(
     }
 
     suspend fun listRemoteFilesP2p(
-        dirPath: String
+        dirPath: String,
+        authToken: String = ""
     ): Result<RemoteDirectoryListing> {
+        val resolvedToken = resolveEffectiveToken(authToken)
+        if (resolvedToken.isBlank()) {
+            return Result.failure(
+                IllegalStateException("يرجى إدخال رمز المصادقة (x-auth-token) أولاً قبل استعراض المجلدات والملفات")
+            )
+        }
         val extra = JSONObject().apply {
             put("path", dirPath)
         }
         return sendJsonCommandOverDataChannel(
             action = "/files",
             extraFields = extra,
+            authToken = resolvedToken,
             timeoutMs = 12_000L
         ).map { json ->
             val filesArray = json.optJSONArray("files") ?: json.optJSONArray("items") ?: JSONArray()
@@ -991,14 +1044,22 @@ class WebRtcP2pClientManager private constructor(
     }
 
     suspend fun deleteRemoteFileP2p(
-        targetPath: String
+        targetPath: String,
+        authToken: String = ""
     ): Result<Unit> {
+        val resolvedToken = resolveEffectiveToken(authToken)
+        if (resolvedToken.isBlank()) {
+            return Result.failure(
+                IllegalStateException("يرجى إدخال رمز المصادقة (x-auth-token) أولاً قبل حذف الملفات")
+            )
+        }
         val extra = JSONObject().apply {
             put("path", targetPath)
         }
         return sendJsonCommandOverDataChannel(
             action = "/delete",
             extraFields = extra,
+            authToken = resolvedToken,
             timeoutMs = 10_000L
         ).map { }
     }
@@ -1007,8 +1068,16 @@ class WebRtcP2pClientManager private constructor(
         context: Context,
         fileItem: RemoteFileItem,
         saveToCacheForStreaming: Boolean = false,
+        authToken: String = "",
         onProgress: (TransferProgress) -> Unit
     ): Result<File> = withContext(Dispatchers.IO) {
+        val resolvedToken = resolveEffectiveToken(authToken)
+        if (resolvedToken.isBlank()) {
+            return@withContext Result.failure(
+                IllegalStateException("يرجى إدخال رمز المصادقة (x-auth-token) أولاً قبل تحميل الملفات")
+            )
+        }
+
         val dc = ensureDataChannelReady(timeoutMs = 8_000L)
             ?: return@withContext Result.failure(
                 IllegalStateException("قناة WebRTC DataChannel غير متصلة بعد")
@@ -1046,7 +1115,9 @@ class WebRtcP2pClientManager private constructor(
             put("reqId", reqId)
             put("action", "/download")
             put("path", fileItem.path)
-            put("token", activeSecretToken)
+            put("headers", buildHeadersJson(resolvedToken))
+            put("x-auth-token", resolvedToken)
+            put("token", resolvedToken)
         }
 
         val bytes = cmd.toString().toByteArray(StandardCharsets.UTF_8)
@@ -1072,8 +1143,16 @@ class WebRtcP2pClientManager private constructor(
         context: Context,
         targetDirPath: String,
         fileUri: android.net.Uri,
+        authToken: String = "",
         onProgress: (TransferProgress) -> Unit
     ): Result<String> = withContext(Dispatchers.IO) {
+        val resolvedToken = resolveEffectiveToken(authToken)
+        if (resolvedToken.isBlank()) {
+            return@withContext Result.failure(
+                IllegalStateException("يرجى إدخال رمز المصادقة (x-auth-token) أولاً قبل رفع الملفات")
+            )
+        }
+
         val dc = ensureDataChannelReady(timeoutMs = 8_000L)
             ?: return@withContext Result.failure(
                 IllegalStateException("قناة WebRTC DataChannel غير متصلة بعد")
@@ -1106,6 +1185,7 @@ class WebRtcP2pClientManager private constructor(
         val startResult = sendJsonCommandOverDataChannel(
             action = "/upload_start",
             extraFields = startExtra,
+            authToken = resolvedToken,
             timeoutMs = 10_000L
         )
         if (startResult.isFailure) {
@@ -1142,7 +1222,9 @@ class WebRtcP2pClientManager private constructor(
                         put("action", "/upload_chunk")
                         put("uploadId", uploadId)
                         put("data", b64)
-                        put("token", activeSecretToken)
+                        put("headers", buildHeadersJson(resolvedToken))
+                        put("x-auth-token", resolvedToken)
+                        put("token", resolvedToken)
                     }
                     val rawBytes = chunkMsg.toString().toByteArray(StandardCharsets.UTF_8)
                     dc.send(DataChannel.Buffer(ByteBuffer.wrap(rawBytes), false))
@@ -1168,6 +1250,7 @@ class WebRtcP2pClientManager private constructor(
             val endResult = sendJsonCommandOverDataChannel(
                 action = "/upload_finish",
                 extraFields = finishExtra,
+                authToken = resolvedToken,
                 timeoutMs = 15_000L
             )
             onProgress(TransferProgress(isActive = false))
@@ -1180,14 +1263,22 @@ class WebRtcP2pClientManager private constructor(
     }
 
     suspend fun requestScreenshotBitmapP2p(
-        quality: Int = 72
+        quality: Int = 72,
+        authToken: String = ""
     ): Result<Bitmap> = withContext(Dispatchers.IO) {
+        val resolvedToken = resolveEffectiveToken(authToken)
+        if (resolvedToken.isBlank()) {
+            return@withContext Result.failure(
+                IllegalStateException("يرجى إدخال رمز المصادقة (x-auth-token) أولاً")
+            )
+        }
         val extra = JSONObject().apply {
             put("quality", quality)
         }
         sendJsonCommandOverDataChannel(
             action = "/screenshot",
             extraFields = extra,
+            authToken = resolvedToken,
             timeoutMs = 8_000L
         ).mapCatching { res ->
             val base64Jpeg = res.optString("jpegBase64")

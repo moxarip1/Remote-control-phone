@@ -76,6 +76,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.model.HomeNodeInfo
+import com.example.repository.AuthTokenManager
 import com.example.webrtc.WebRtcP2pClientManager
 import com.google.firebase.auth.FirebaseAuth
 import kotlinx.coroutines.Dispatchers
@@ -108,16 +109,20 @@ fun ScreenMirroringDashboard(
     val p2pRealtimeState by p2pManager.p2pRealtimeState.collectAsStateWithLifecycle()
     val p2pConnectionStatus by p2pManager.p2pConnectionStatus.collectAsStateWithLifecycle()
     val remoteVideoTrack by p2pManager.remoteVideoTrack.collectAsStateWithLifecycle()
+    val savedAuthToken by AuthTokenManager.authTokenFlow.collectAsStateWithLifecycle()
 
     val isNodeOnline = discoveredNode?.isOnline == true
+    val effectiveToken = savedAuthToken.trim().ifBlank {
+        AuthTokenManager.getSavedAuthToken(context)
+    }
 
     // Automatically ensure the global P2P tunnel is connected when entering the dashboard
-    LaunchedEffect(discoveredNode?.userId, discoveredNode?.secretToken, discoveredNode?.isOnline) {
-        if (discoveredNode != null && discoveredNode.isOnline) {
+    LaunchedEffect(discoveredNode?.userId, effectiveToken, discoveredNode?.isOnline) {
+        if (discoveredNode != null && discoveredNode.isOnline && effectiveToken.isNotBlank()) {
             val uid = FirebaseAuth.getInstance().currentUser?.uid ?: discoveredNode.userId
             p2pManager.connectToHomeNodeP2p(
                 userId = uid,
-                secretToken = discoveredNode.secretToken
+                secretToken = effectiveToken
             )
         }
     }
@@ -138,8 +143,12 @@ fun ScreenMirroringDashboard(
             .build()
     }
 
-    LaunchedEffect(discoveredNode?.secretToken, discoveredNode?.isOnline, isHttpPollingActive, isP2pConnected) {
+    LaunchedEffect(effectiveToken, discoveredNode?.isOnline, isHttpPollingActive, isP2pConnected) {
         if (!isHttpPollingActive || discoveredNode == null || !discoveredNode.isOnline) {
+            return@LaunchedEffect
+        }
+        if (effectiveToken.isBlank()) {
+            httpPollingError = "تنبيه: رمز المصادقة (x-auth-token) فارغ! يرجى إدخال رمز المصادقة أولاً."
             return@LaunchedEffect
         }
         while (isActive && isHttpPollingActive) {
@@ -147,7 +156,7 @@ fun ScreenMirroringDashboard(
 
             // 1. Primary path: Request `/screenshot` over Global WebRTC RTCDataChannel
             val p2pResult = if (p2pManager.isP2pConnected.value) {
-                p2pManager.requestScreenshotBitmapP2p(quality = 72)
+                p2pManager.requestScreenshotBitmapP2p(quality = 72, authToken = effectiveToken)
             } else {
                 Result.failure(IllegalStateException("P2P negotiating"))
             }
@@ -169,13 +178,19 @@ fun ScreenMirroringDashboard(
                         val url = "http://$host:${discoveredNode.port}/screenshot?t=$startMs"
                         val req = Request.Builder()
                             .url(url)
-                            .header("x-auth-token", discoveredNode.secretToken)
+                            .header("Content-Type", "application/json")
+                            .header("x-auth-token", effectiveToken)
                             .get()
                             .build()
 
                         screenshotHttpClient.newCall(req).execute().use { response ->
                             if (!response.isSuccessful) {
-                                Result.failure(IllegalStateException("بانتظار اكتمال نفق WebRTC P2P..."))
+                                val p2pFallback = p2pManager.requestScreenshotBitmapP2p(quality = 72, authToken = effectiveToken)
+                                if (p2pFallback.isSuccess) {
+                                    p2pFallback
+                                } else {
+                                    Result.failure(IllegalStateException("بانتظار اكتمال نفق WebRTC P2P..."))
+                                }
                             } else {
                                 val bytes = response.body?.bytes()
                                 if (bytes != null && bytes.isNotEmpty()) {
@@ -191,7 +206,7 @@ fun ScreenMirroringDashboard(
                             }
                         }
                     } catch (_: Exception) {
-                        p2pManager.requestScreenshotBitmapP2p(quality = 72)
+                        p2pManager.requestScreenshotBitmapP2p(quality = 72, authToken = effectiveToken)
                     }
                 }
             }

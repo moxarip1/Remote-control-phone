@@ -18,6 +18,9 @@ import java.net.URLEncoder
 class LocalFileServer(
     val serverPort: Int = DEFAULT_PORT,
     private val secretTokenProvider: () -> String,
+    private val validTokensProvider: () -> Set<String> = {
+        setOf(secretTokenProvider().trim()).filter { it.isNotBlank() }.toSet()
+    },
     private val statusProvider: () -> Triple<Int, Long, Long>,
     private val rootDirProvider: () -> File,
     private val screenshotBitmapProvider: () -> Bitmap? = { null },
@@ -29,14 +32,25 @@ class LocalFileServer(
         val uri = session.uri ?: "/"
         val method = session.method ?: Method.GET
 
-        // 1. Zero-Trust Session Token Verification via x-auth-token Header
-        val expectedToken = secretTokenProvider()
-        val providedToken = session.headers["x-auth-token"]
-            ?: session.headers["X-Auth-Token"]
-            ?: getQueryParam(session, "token")
-            ?: ""
+        if (method == Method.OPTIONS) {
+            return newFixedLengthResponse(Response.Status.OK, MIME_JSON, "{}").apply {
+                addHeader("Access-Control-Allow-Origin", "*")
+                addHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+                addHeader("Access-Control-Allow-Headers", "Content-Type, x-auth-token, X-Auth-Token")
+            }
+        }
 
-        if (expectedToken.isNotBlank() && providedToken != expectedToken) {
+        // 1. Zero-Trust Session Token Verification via x-auth-token Header
+        val expectedTokens = validTokensProvider().map { it.trim() }.filter { it.isNotBlank() }.toSet()
+        val headerToken = session.headers.entries
+            .firstOrNull { it.key.equals("x-auth-token", ignoreCase = true) || it.key.equals("http_x_auth_token", ignoreCase = true) }
+            ?.value
+        val providedToken = (headerToken
+            ?: getQueryParam(session, "x-auth-token")
+            ?: getQueryParam(session, "token")
+            ?: "").trim()
+
+        if (providedToken.isBlank() || (expectedTokens.isNotEmpty() && providedToken !in expectedTokens)) {
             emitLog(
                 method = method.name,
                 endpoint = uri,

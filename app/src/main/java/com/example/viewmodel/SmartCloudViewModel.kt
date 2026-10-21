@@ -20,6 +20,7 @@ import com.example.model.RemoteFileItem
 import com.example.model.ServerLog
 import com.example.model.TransferProgress
 import com.example.receiver.BootCompletedReceiver
+import com.example.repository.AuthTokenManager
 import com.example.repository.SmartCloudRepository
 import com.example.server.LocalFileServer
 import com.example.service.HomeServerForegroundService
@@ -97,12 +98,25 @@ class SmartCloudViewModel(
     private val _pendingDeleteItem = MutableStateFlow<RemoteFileItem?>(null)
     val pendingDeleteItem: StateFlow<RemoteFileItem?> = _pendingDeleteItem.asStateFlow()
 
+    // Persistent Auth Token (x-auth-token) saved in localStorage (SharedPreferences)
+    val savedAuthToken: StateFlow<String> = AuthTokenManager.authTokenFlow
+
+    private val _isAuthTokenDialogOpen = MutableStateFlow(false)
+    val isAuthTokenDialogOpen: StateFlow<Boolean> = _isAuthTokenDialogOpen.asStateFlow()
+
     private var nodeListenerJob: Job? = null
     private var p2pStateWatcherJob: Job? = null
     private var alwaysOnServerWatchdogJob: Job? = null
     private var lastAutoLoadedNodeKey: String? = null
 
     init {
+        if (appContext != null) {
+            val initialToken = AuthTokenManager.init(appContext)
+            if (initialToken.isNotBlank()) {
+                p2pClientManager?.updateAuthToken(initialToken)
+            }
+        }
+
         viewModelScope.launch {
             repository.observeAuthState()
                 .catch { e -> _errorBannerMessage.value = e.localizedMessage }
@@ -136,19 +150,115 @@ class SmartCloudViewModel(
             p2pStateWatcherJob = viewModelScope.launch {
                 p2pClientManager.isP2pConnected.collect { connected ->
                     if (connected) {
+                        val token = AuthTokenManager.getSavedAuthToken(appContext)
                         val node = _discoveredHomeNode.value
-                        if (node != null) {
-                            repository.pingHomeNodeStatus(node, p2pClientManager).onSuccess { refreshed ->
+                        if (node != null && token.isNotBlank()) {
+                            repository.pingHomeNodeStatus(node, p2pClientManager, token).onSuccess { refreshed ->
                                 _discoveredHomeNode.value = refreshed
                             }
                         }
-                        if (_selectedMode.value == AppMode.ADMIN_CONTROLLER) {
+                        if (_selectedMode.value == AppMode.ADMIN_CONTROLLER && token.isNotBlank()) {
                             loadRemoteDirectory(_currentRemotePath.value)
                         }
                     }
                 }
             }
         }
+    }
+
+    fun openAuthTokenDialog() {
+        _isAuthTokenDialogOpen.value = true
+    }
+
+    fun closeAuthTokenDialog() {
+        _isAuthTokenDialogOpen.value = false
+    }
+
+    /**
+     * Saves the Auth Token (`x-auth-token`) automatically in localStorage (`SharedPreferences`),
+     * updates the active WebRTC/HTTP headers, and syncs with the Home Node Server if running.
+     */
+    fun updateAuthToken(newToken: String, closeDialog: Boolean = false) {
+        val trimmed = newToken.trim()
+        AuthTokenManager.saveAuthToken(appContext, trimmed, isManualOverride = true)
+        p2pClientManager?.updateAuthToken(trimmed)
+
+        if (closeDialog) {
+            _isAuthTokenDialogOpen.value = false
+        }
+
+        if (trimmed.isBlank()) {
+            _errorBannerMessage.value =
+                "تنبيه المصادقة: رمز المصادقة (x-auth-token) فارغ! لن يتم إرسال أي طلبات حتى يتم إدخال التوكن."
+            return
+        }
+
+        // If Home Node Server is running on this device, update its expected x-auth-token immediately
+        if (appContext != null && isServerRunning.value) {
+            try {
+                val intent = Intent(appContext.applicationContext, HomeServerForegroundService::class.java).apply {
+                    action = HomeServerForegroundService.ACTION_UPDATE_AUTH_TOKEN
+                    putExtra(HomeServerForegroundService.EXTRA_AUTH_TOKEN, trimmed)
+                }
+                appContext.applicationContext.startService(intent)
+            } catch (_: Throwable) {
+            }
+        }
+
+        _errorBannerMessage.value = null
+        _statusBannerMessage.value = "تم حفظ رمز المصادقة (x-auth-token) في localStorage وتفعيله لجميع الطلبات"
+
+        val node = _discoveredHomeNode.value
+        if (node != null && node.isOnline &&
+            (_selectedMode.value == AppMode.ADMIN_CONTROLLER || _selectedMode.value == AppMode.SCREEN_MIRRORING)
+        ) {
+            val uid = _currentUser.value?.uid ?: node.userId
+            p2pClientManager?.connectToHomeNodeP2p(
+                userId = uid,
+                secretToken = trimmed,
+                forceReconnect = false
+            )
+            if (_selectedMode.value == AppMode.ADMIN_CONTROLLER) {
+                loadRemoteDirectory(_currentRemotePath.value)
+            }
+        }
+    }
+
+    /**
+     * Automatically syncs the `x-auth-token` from the discovered Home Node in Firebase
+     * into localStorage (`SharedPreferences`).
+     */
+    fun syncAuthTokenFromCloudNode() {
+        val cloudToken = _discoveredHomeNode.value?.secretToken?.trim()
+            ?.ifBlank { localServerNodeInfo.value?.secretToken?.trim().orEmpty() }
+            .orEmpty()
+        if (cloudToken.isBlank()) {
+            _errorBannerMessage.value = "لا يوجد رمز مصادقة منشور من هاتف المنزل حالياً، يرجى إدخاله يدوياً"
+            return
+        }
+        AuthTokenManager.saveAuthToken(appContext, cloudToken, isManualOverride = false)
+        p2pClientManager?.updateAuthToken(cloudToken)
+        _isAuthTokenDialogOpen.value = false
+        _errorBannerMessage.value = null
+        _statusBannerMessage.value = "تمت مزامنة وحفظ رمز المصادقة (x-auth-token) تلقائياً من هاتف المنزل"
+        if (_selectedMode.value == AppMode.ADMIN_CONTROLLER) {
+            loadRemoteDirectory(_currentRemotePath.value)
+        }
+    }
+
+    /**
+     * Enforces Requirement 4: Blocks any outgoing request if the Auth Token (`x-auth-token`) is empty,
+     * showing a prominent alert asking the user to enter the token first.
+     */
+    private fun requireValidAuthTokenOrAlert(): String? {
+        val currentToken = AuthTokenManager.getSavedAuthToken(appContext).trim()
+        if (currentToken.isBlank()) {
+            _errorBannerMessage.value =
+                "تنبيه المصادقة: رمز المصادقة (x-auth-token) فارغ! يرجى إدخال رمز المصادقة أولاً لإتمام الطلب."
+            _isAuthTokenDialogOpen.value = true
+            return null
+        }
+        return currentToken
     }
 
     fun tryAutoSignIn(context: Context) {
@@ -342,10 +452,13 @@ class SmartCloudViewModel(
                 }
 
                 if (node != null && node.isOnline) {
-                    p2pClientManager?.connectToHomeNodeP2p(
-                        userId = uid.ifBlank { node.userId },
-                        secretToken = node.secretToken
-                    )
+                    val syncedToken = AuthTokenManager.syncWithDiscoveredNodeToken(appContext, node.secretToken)
+                    if (syncedToken.isNotBlank()) {
+                        p2pClientManager?.connectToHomeNodeP2p(
+                            userId = uid.ifBlank { node.userId },
+                            secretToken = syncedToken
+                        )
+                    }
                     if (mode == AppMode.ADMIN_CONTROLLER) {
                         loadRemoteDirectory(dirPath = _currentRemotePath.value)
                     }
@@ -525,14 +638,23 @@ class SmartCloudViewModel(
                 }
                 .collect { nodeInfo ->
                     _discoveredHomeNode.value = nodeInfo
+                    val effectiveToken = if (nodeInfo != null && nodeInfo.secretToken.isNotBlank()) {
+                        AuthTokenManager.syncWithDiscoveredNodeToken(appContext, nodeInfo.secretToken)
+                    } else {
+                        AuthTokenManager.getSavedAuthToken(appContext)
+                    }
+                    if (effectiveToken.isNotBlank()) {
+                        p2pClientManager?.updateAuthToken(effectiveToken)
+                    }
+
                     val currentMode = _selectedMode.value
                     val isAdminMode = currentMode == AppMode.ADMIN_CONTROLLER || currentMode == AppMode.SCREEN_MIRRORING
-                    if (nodeInfo != null && nodeInfo.isOnline && isAdminMode) {
+                    if (nodeInfo != null && nodeInfo.isOnline && isAdminMode && effectiveToken.isNotBlank()) {
                         p2pClientManager?.connectToHomeNodeP2p(
                             userId = uid,
-                            secretToken = nodeInfo.secretToken
+                            secretToken = effectiveToken
                         )
-                        val endpointKey = "${nodeInfo.effectiveSignalingPath()}:${nodeInfo.secretToken}"
+                        val endpointKey = "${nodeInfo.effectiveSignalingPath()}:$effectiveToken"
                         if (lastAutoLoadedNodeKey != endpointKey && currentMode == AppMode.ADMIN_CONTROLLER) {
                             lastAutoLoadedNodeKey = endpointKey
                             delay(350L)
@@ -555,15 +677,16 @@ class SmartCloudViewModel(
     }
 
     fun refreshAdminConnection() {
+        val token = requireValidAuthTokenOrAlert() ?: return
         val node = _discoveredHomeNode.value ?: return
         val uid = _currentUser.value?.uid ?: node.userId
         p2pClientManager?.connectToHomeNodeP2p(
             userId = uid,
-            secretToken = node.secretToken,
+            secretToken = token,
             forceReconnect = !isP2pConnected.value
         )
         viewModelScope.launch {
-            repository.pingHomeNodeStatus(node, p2pClientManager).onSuccess { refreshedNode ->
+            repository.pingHomeNodeStatus(node, p2pClientManager, token).onSuccess { refreshedNode ->
                 _discoveredHomeNode.value = refreshedNode
             }
             loadRemoteDirectory(_currentRemotePath.value)
@@ -571,6 +694,7 @@ class SmartCloudViewModel(
     }
 
     fun loadRemoteDirectory(dirPath: String = "") {
+        val token = requireValidAuthTokenOrAlert() ?: return
         val node = _discoveredHomeNode.value
         if (node == null || !node.isOnline) {
             _errorBannerMessage.value = "الخادم المنزلي غير متصل حالياً"
@@ -580,7 +704,12 @@ class SmartCloudViewModel(
         viewModelScope.launch {
             _isLoadingFiles.value = true
             _errorBannerMessage.value = null
-            val result = repository.listRemoteFiles(node, dirPath, p2pClientManager)
+            val result = repository.listRemoteFiles(
+                node = node,
+                dirPath = dirPath,
+                p2pManager = p2pClientManager,
+                authToken = token
+            )
             _isLoadingFiles.value = false
 
             result.onSuccess { listing ->
@@ -610,6 +739,7 @@ class SmartCloudViewModel(
     }
 
     fun onRemoteFileClicked(context: Context, item: RemoteFileItem) {
+        if (requireValidAuthTokenOrAlert() == null) return
         if (item.isDirectory) {
             loadRemoteDirectory(item.path)
         } else if (item.isStreamableMedia()) {
@@ -620,6 +750,7 @@ class SmartCloudViewModel(
     }
 
     fun openStreamPlayer(item: RemoteFileItem) {
+        if (requireValidAuthTokenOrAlert() == null) return
         _activeStreamMedia.value = item
     }
 
@@ -628,11 +759,13 @@ class SmartCloudViewModel(
     }
 
     fun getStreamUrlForItem(item: RemoteFileItem): String? {
+        val token = requireValidAuthTokenOrAlert() ?: return null
         val node = _discoveredHomeNode.value ?: return null
-        return repository.buildStreamUrl(node, item)
+        return repository.buildStreamUrl(node, item, token)
     }
 
     fun downloadFileFromHomeNode(context: Context, item: RemoteFileItem) {
+        val token = requireValidAuthTokenOrAlert() ?: return
         val node = _discoveredHomeNode.value ?: return
         viewModelScope.launch {
             _errorBannerMessage.value = null
@@ -640,6 +773,7 @@ class SmartCloudViewModel(
                 context = context,
                 node = node,
                 fileItem = item,
+                authToken = token,
                 onProgress = { progress -> _transferProgress.value = progress }
             )
             result.onSuccess { savedFile ->
@@ -651,6 +785,7 @@ class SmartCloudViewModel(
     }
 
     fun uploadFileToCurrentRemoteDir(context: Context, uri: Uri) {
+        val token = requireValidAuthTokenOrAlert() ?: return
         val node = _discoveredHomeNode.value ?: return
         val targetDir = _currentRemotePath.value
         viewModelScope.launch {
@@ -660,6 +795,7 @@ class SmartCloudViewModel(
                 node = node,
                 targetDirPath = targetDir,
                 fileUri = uri,
+                authToken = token,
                 onProgress = { progress -> _transferProgress.value = progress }
             )
             result.onSuccess { uploadedFileName ->
@@ -672,6 +808,7 @@ class SmartCloudViewModel(
     }
 
     fun requestDeleteRemoteFile(item: RemoteFileItem) {
+        if (requireValidAuthTokenOrAlert() == null) return
         _pendingDeleteItem.value = item
     }
 
@@ -680,13 +817,19 @@ class SmartCloudViewModel(
     }
 
     fun confirmDeleteRemoteFile() {
+        val token = requireValidAuthTokenOrAlert() ?: return
         val item = _pendingDeleteItem.value ?: return
         val node = _discoveredHomeNode.value ?: return
         _pendingDeleteItem.value = null
 
         viewModelScope.launch {
             _errorBannerMessage.value = null
-            val result = repository.deleteRemoteFile(node, item.path, p2pClientManager)
+            val result = repository.deleteRemoteFile(
+                node = node,
+                targetPath = item.path,
+                p2pManager = p2pClientManager,
+                authToken = token
+            )
             result.onSuccess {
                 _statusBannerMessage.value = "تم حذف ${item.name} من الخادم المنزلي عبر P2P"
                 loadRemoteDirectory(_currentRemotePath.value)

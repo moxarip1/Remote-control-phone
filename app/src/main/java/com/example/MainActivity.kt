@@ -101,6 +101,8 @@ fun SmartHomeCloudRootApp(
     val transferProgress by viewModel.transferProgress.collectAsStateWithLifecycle()
     val activeStreamMedia by viewModel.activeStreamMedia.collectAsStateWithLifecycle()
     val pendingDeleteItem by viewModel.pendingDeleteItem.collectAsStateWithLifecycle()
+    val savedAuthToken by viewModel.savedAuthToken.collectAsStateWithLifecycle()
+    val isAuthTokenDialogOpen by viewModel.isAuthTokenDialogOpen.collectAsStateWithLifecycle()
 
     var isNotificationSkipped by rememberSaveable { mutableStateOf(false) }
 
@@ -242,6 +244,13 @@ fun SmartHomeCloudRootApp(
                     statusMessage = statusBanner,
                     isMediaProjectionEnabled = isMediaProjectionEnabled,
                     webRtcStateText = webRtcStateText,
+                    authToken = savedAuthToken,
+                    isAuthTokenDialogOpen = isAuthTokenDialogOpen,
+                    onUpdateAuthToken = { newToken, closeDialog ->
+                        viewModel.updateAuthToken(newToken, closeDialog)
+                    },
+                    onOpenAuthTokenDialog = { viewModel.openAuthTokenDialog() },
+                    onCloseAuthTokenDialog = { viewModel.closeAuthTokenDialog() },
                     onStartServer = { viewModel.startHomeServerService(context, silent = true) },
                     onRequestMediaProjection = {
                         val mpm = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? MediaProjectionManager
@@ -269,6 +278,14 @@ fun SmartHomeCloudRootApp(
                     statusMessage = statusBanner,
                     errorMessage = errorBanner,
                     canNavigateUp = viewModel.canNavigateUpInRemoteBrowser(),
+                    authToken = savedAuthToken,
+                    isAuthTokenDialogOpen = isAuthTokenDialogOpen,
+                    onUpdateAuthToken = { newToken, closeDialog ->
+                        viewModel.updateAuthToken(newToken, closeDialog)
+                    },
+                    onSyncAuthTokenFromCloud = { viewModel.syncAuthTokenFromCloudNode() },
+                    onOpenAuthTokenDialog = { viewModel.openAuthTokenDialog() },
+                    onCloseAuthTokenDialog = { viewModel.closeAuthTokenDialog() },
                     onNavigateUp = { viewModel.navigateUpInRemoteBrowser() },
                     onBackToModeSelector = { viewModel.selectMode(AppMode.NONE) },
                     onRefreshConnection = { viewModel.refreshAdminConnection() },

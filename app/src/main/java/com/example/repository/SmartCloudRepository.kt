@@ -406,12 +406,26 @@ class SmartCloudRepository(
         return "http://$host:${node.port}"
     }
 
+    private fun resolveEffectiveAuthToken(explicitToken: String, node: HomeNodeInfo): String {
+        return explicitToken.trim()
+            .ifBlank { AuthTokenManager.getSavedAuthToken() }
+            .ifBlank { node.secretToken.trim() }
+    }
+
     suspend fun pingHomeNodeStatus(
         node: HomeNodeInfo,
-        p2pManager: com.example.webrtc.WebRtcP2pClientManager? = null
+        p2pManager: com.example.webrtc.WebRtcP2pClientManager? = null,
+        authToken: String = ""
     ): Result<HomeNodeInfo> = withContext(Dispatchers.IO) {
+        val resolvedToken = resolveEffectiveAuthToken(authToken, node)
+        if (resolvedToken.isBlank()) {
+            return@withContext Result.failure(
+                IllegalStateException("يرجى إدخال رمز المصادقة (x-auth-token) أولاً قبل إرسال الطلبات")
+            )
+        }
+
         if (p2pManager != null && p2pManager.isP2pConnected.value) {
-            val p2pRes = p2pManager.requestNodeStatusP2p(node)
+            val p2pRes = p2pManager.requestNodeStatusP2p(node, resolvedToken)
             if (p2pRes.isSuccess) return@withContext p2pRes
         }
 
@@ -419,13 +433,18 @@ class SmartCloudRepository(
             val url = "${resolveLoopbackBaseUrl(node)}/status"
             val request = Request.Builder()
                 .url(url)
-                .header("x-auth-token", node.secretToken)
+                .header("Content-Type", "application/json")
+                .header("x-auth-token", resolvedToken)
                 .get()
                 .build()
 
             httpClient.newCall(request).execute().use { response ->
                 val bodyStr = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
+                    if (p2pManager != null) {
+                        val p2pFallback = p2pManager.requestNodeStatusP2p(node, resolvedToken)
+                        if (p2pFallback.isSuccess) return@withContext p2pFallback
+                    }
                     return@withContext Result.failure(
                         IllegalStateException("HTTP ${response.code}: $bodyStr")
                     )
@@ -445,7 +464,7 @@ class SmartCloudRepository(
             throw e
         } catch (e: Exception) {
             if (p2pManager != null) {
-                return@withContext p2pManager.requestNodeStatusP2p(node)
+                return@withContext p2pManager.requestNodeStatusP2p(node, resolvedToken)
             }
             Result.failure(e)
         }
@@ -461,11 +480,19 @@ class SmartCloudRepository(
     suspend fun listRemoteFiles(
         node: HomeNodeInfo,
         dirPath: String = "",
-        p2pManager: com.example.webrtc.WebRtcP2pClientManager? = null
+        p2pManager: com.example.webrtc.WebRtcP2pClientManager? = null,
+        authToken: String = ""
     ): Result<RemoteDirectoryListing> = withContext(Dispatchers.IO) {
+        val resolvedToken = resolveEffectiveAuthToken(authToken, node)
+        if (resolvedToken.isBlank()) {
+            return@withContext Result.failure(
+                IllegalStateException("يرجى إدخال رمز المصادقة (x-auth-token) أولاً قبل استعراض المجلدات والملفات")
+            )
+        }
+
         // 1. Primary path: Global WebRTC P2P RTCDataChannel
         if (p2pManager != null && p2pManager.isP2pConnected.value) {
-            val p2pResult = p2pManager.listRemoteFilesP2p(dirPath)
+            val p2pResult = p2pManager.listRemoteFilesP2p(dirPath, resolvedToken)
             if (p2pResult.isSuccess) return@withContext p2pResult
         }
 
@@ -475,13 +502,18 @@ class SmartCloudRepository(
             val url = "${resolveLoopbackBaseUrl(node)}/files?path=$encodedPath"
             val request = Request.Builder()
                 .url(url)
-                .header("x-auth-token", node.secretToken)
+                .header("Content-Type", "application/json")
+                .header("x-auth-token", resolvedToken)
                 .get()
                 .build()
 
             httpClient.newCall(request).execute().use { response ->
                 val bodyStr = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
+                    if (p2pManager != null) {
+                        val p2pFallback = p2pManager.listRemoteFilesP2p(dirPath, resolvedToken)
+                        if (p2pFallback.isSuccess) return@withContext p2pFallback
+                    }
                     return@withContext Result.failure(
                         IllegalStateException("HTTP ${response.code}: $bodyStr")
                     )
@@ -519,7 +551,7 @@ class SmartCloudRepository(
             throw e
         } catch (e: Exception) {
             if (p2pManager != null) {
-                return@withContext p2pManager.listRemoteFilesP2p(dirPath)
+                return@withContext p2pManager.listRemoteFilesP2p(dirPath, resolvedToken)
             }
             Result.failure(e)
         }
@@ -529,14 +561,23 @@ class SmartCloudRepository(
         context: Context,
         node: HomeNodeInfo,
         fileItem: RemoteFileItem,
+        authToken: String = "",
         onProgress: (TransferProgress) -> Unit
     ): Result<File> = withContext(Dispatchers.IO) {
+        val resolvedToken = resolveEffectiveAuthToken(authToken, node)
+        if (resolvedToken.isBlank()) {
+            return@withContext Result.failure(
+                IllegalStateException("يرجى إدخال رمز المصادقة (x-auth-token) أولاً قبل تحميل الملفات")
+            )
+        }
+
         val p2pManager = com.example.webrtc.WebRtcP2pClientManager.getInstance(context)
         if (p2pManager.isP2pConnected.value) {
             val p2pRes = p2pManager.downloadRemoteFileP2p(
                 context = context,
                 fileItem = fileItem,
                 saveToCacheForStreaming = false,
+                authToken = resolvedToken,
                 onProgress = onProgress
             )
             if (p2pRes.isSuccess) return@withContext p2pRes
@@ -547,12 +588,21 @@ class SmartCloudRepository(
             val url = "${resolveLoopbackBaseUrl(node)}/download?path=$encodedPath"
             val request = Request.Builder()
                 .url(url)
-                .header("x-auth-token", node.secretToken)
+                .header("Content-Type", "application/json")
+                .header("x-auth-token", resolvedToken)
                 .get()
                 .build()
 
             httpClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
+                    val p2pFallback = p2pManager.downloadRemoteFileP2p(
+                        context = context,
+                        fileItem = fileItem,
+                        saveToCacheForStreaming = false,
+                        authToken = resolvedToken,
+                        onProgress = onProgress
+                    )
+                    if (p2pFallback.isSuccess) return@withContext p2pFallback
                     return@withContext Result.failure(
                         IllegalStateException("فشل التحميل (HTTP ${response.code})")
                     )
@@ -619,6 +669,7 @@ class SmartCloudRepository(
                 context = context,
                 fileItem = fileItem,
                 saveToCacheForStreaming = false,
+                authToken = resolvedToken,
                 onProgress = onProgress
             )
         }
@@ -629,14 +680,23 @@ class SmartCloudRepository(
         node: HomeNodeInfo,
         targetDirPath: String,
         fileUri: Uri,
+        authToken: String = "",
         onProgress: (TransferProgress) -> Unit
     ): Result<String> = withContext(Dispatchers.IO) {
+        val resolvedToken = resolveEffectiveAuthToken(authToken, node)
+        if (resolvedToken.isBlank()) {
+            return@withContext Result.failure(
+                IllegalStateException("يرجى إدخال رمز المصادقة (x-auth-token) أولاً قبل رفع الملفات")
+            )
+        }
+
         val p2pManager = com.example.webrtc.WebRtcP2pClientManager.getInstance(context)
         if (p2pManager.isP2pConnected.value) {
             val p2pRes = p2pManager.uploadFileToHomeNodeP2p(
                 context = context,
                 targetDirPath = targetDirPath,
                 fileUri = fileUri,
+                authToken = resolvedToken,
                 onProgress = onProgress
             )
             if (p2pRes.isSuccess) return@withContext p2pRes
@@ -698,7 +758,8 @@ class SmartCloudRepository(
 
             val request = Request.Builder()
                 .url(url)
-                .header("x-auth-token", node.secretToken)
+                .header("Content-Type", "application/json")
+                .header("x-auth-token", resolvedToken)
                 .post(streamingBody)
                 .build()
 
@@ -706,6 +767,14 @@ class SmartCloudRepository(
                 onProgress(TransferProgress(isActive = false))
                 val bodyStr = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
+                    val p2pFallback = p2pManager.uploadFileToHomeNodeP2p(
+                        context = context,
+                        targetDirPath = targetDirPath,
+                        fileUri = fileUri,
+                        authToken = resolvedToken,
+                        onProgress = onProgress
+                    )
+                    if (p2pFallback.isSuccess) return@withContext p2pFallback
                     return@withContext Result.failure(
                         IllegalStateException("فشل رفع الملف (HTTP ${response.code}): $bodyStr")
                     )
@@ -721,6 +790,7 @@ class SmartCloudRepository(
                 context = context,
                 targetDirPath = targetDirPath,
                 fileUri = fileUri,
+                authToken = resolvedToken,
                 onProgress = onProgress
             )
         }
@@ -729,10 +799,18 @@ class SmartCloudRepository(
     suspend fun deleteRemoteFile(
         node: HomeNodeInfo,
         targetPath: String,
-        p2pManager: com.example.webrtc.WebRtcP2pClientManager? = null
+        p2pManager: com.example.webrtc.WebRtcP2pClientManager? = null,
+        authToken: String = ""
     ): Result<Unit> = withContext(Dispatchers.IO) {
+        val resolvedToken = resolveEffectiveAuthToken(authToken, node)
+        if (resolvedToken.isBlank()) {
+            return@withContext Result.failure(
+                IllegalStateException("يرجى إدخال رمز المصادقة (x-auth-token) أولاً قبل حذف الملفات")
+            )
+        }
+
         if (p2pManager != null && p2pManager.isP2pConnected.value) {
-            val p2pRes = p2pManager.deleteRemoteFileP2p(targetPath)
+            val p2pRes = p2pManager.deleteRemoteFileP2p(targetPath, resolvedToken)
             if (p2pRes.isSuccess) return@withContext p2pRes
         }
 
@@ -741,13 +819,18 @@ class SmartCloudRepository(
             val url = "${resolveLoopbackBaseUrl(node)}/delete?path=$encodedPath"
             val request = Request.Builder()
                 .url(url)
-                .header("x-auth-token", node.secretToken)
+                .header("Content-Type", "application/json")
+                .header("x-auth-token", resolvedToken)
                 .delete()
                 .build()
 
             httpClient.newCall(request).execute().use { response ->
                 val bodyStr = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
+                    if (p2pManager != null) {
+                        val p2pFallback = p2pManager.deleteRemoteFileP2p(targetPath, resolvedToken)
+                        if (p2pFallback.isSuccess) return@withContext p2pFallback
+                    }
                     return@withContext Result.failure(
                         IllegalStateException("فشل الحذف (HTTP ${response.code}): $bodyStr")
                     )
@@ -758,15 +841,21 @@ class SmartCloudRepository(
             throw e
         } catch (e: Exception) {
             if (p2pManager != null) {
-                return@withContext p2pManager.deleteRemoteFileP2p(targetPath)
+                return@withContext p2pManager.deleteRemoteFileP2p(targetPath, resolvedToken)
             }
             Result.failure(e)
         }
     }
 
-    fun buildStreamUrl(node: HomeNodeInfo, fileItem: RemoteFileItem): String {
+    fun buildStreamUrl(
+        node: HomeNodeInfo,
+        fileItem: RemoteFileItem,
+        authToken: String = ""
+    ): String {
+        val resolvedToken = resolveEffectiveAuthToken(authToken, node)
         val encodedPath = URLEncoder.encode(fileItem.path, "UTF-8")
-        return "${resolveLoopbackBaseUrl(node)}/stream?path=$encodedPath"
+        val encodedToken = URLEncoder.encode(resolvedToken, "UTF-8")
+        return "${resolveLoopbackBaseUrl(node)}/stream?path=$encodedPath&x-auth-token=$encodedToken"
     }
 
     private companion object {

@@ -44,6 +44,7 @@ import com.example.R
 import com.example.model.HomeNodeInfo
 import com.example.model.RemoteFileItem
 import com.example.model.ServerLog
+import com.example.repository.AuthTokenManager
 import com.example.repository.SmartCloudRepository
 import com.example.server.LocalFileServer
 import com.example.webrtc.WebRtcP2pClientManager
@@ -181,6 +182,24 @@ class HomeServerForegroundService : Service() {
                 return START_NOT_STICKY
             }
 
+            ACTION_UPDATE_AUTH_TOKEN -> {
+                val updatedToken = intent.getStringExtra(EXTRA_AUTH_TOKEN)?.trim().orEmpty()
+                if (updatedToken.isNotBlank()) {
+                    sessionSecretToken = updatedToken
+                    AuthTokenManager.saveAuthToken(applicationContext, updatedToken, isManualOverride = true)
+                    appendLog(
+                        ServerLog(
+                            method = "AUTH",
+                            endpoint = "/x-auth-token",
+                            message = "تم تحديث رمز المصادقة (x-auth-token) ومزامنته مع السحابة"
+                        )
+                    )
+                    serviceScope.launch {
+                        syncNodeStateWithCloud(isOnline = _isRunning.value)
+                    }
+                }
+            }
+
             ACTION_ENABLE_MEDIA_PROJECTION -> {
                 val resultCode = intent.getIntExtra(EXTRA_PROJECTION_RESULT_CODE, Activity.RESULT_CANCELED)
                 @Suppress("DEPRECATION")
@@ -286,9 +305,19 @@ class HomeServerForegroundService : Service() {
         }
     }
 
+    private fun resolveAcceptedTokens(): Set<String> {
+        val tokens = mutableSetOf<String>()
+        if (sessionSecretToken.isNotBlank()) tokens.add(sessionSecretToken.trim())
+        val saved = AuthTokenManager.getSavedAuthToken(applicationContext)
+        if (saved.isNotBlank()) tokens.add(saved)
+        val currentCloudToken = _currentNodeInfo.value?.secretToken?.trim().orEmpty()
+        if (currentCloudToken.isNotBlank()) tokens.add(currentCloudToken)
+        return tokens
+    }
+
     private fun startHomeNodeServer(port: Int) {
         activePort = port
-        sessionSecretToken = UUID.randomUUID().toString()
+        sessionSecretToken = AuthTokenManager.ensureServerPersistentToken(applicationContext)
         _isRunning.value = true
 
         val uid = try {
@@ -345,6 +374,7 @@ class HomeServerForegroundService : Service() {
                 val server = LocalFileServer(
                     serverPort = candidatePort,
                     secretTokenProvider = { sessionSecretToken },
+                    validTokensProvider = { resolveAcceptedTokens() },
                     statusProvider = { readHardwareStatus() },
                     rootDirProvider = { resolveStorageRootDir() },
                     screenshotBitmapProvider = { captureHomeNodeScreenBitmap() },
@@ -1175,16 +1205,21 @@ class HomeServerForegroundService : Service() {
 
         val reqId = request.optString("reqId")
         val action = request.optString("action")
-        val token = request.optString("token")
+        val headersObj = request.optJSONObject("headers")
+        val headerToken = headersObj?.optString("x-auth-token")?.ifBlank { headersObj.optString("X-Auth-Token") }.orEmpty()
+        val token = headerToken
+            .ifBlank { request.optString("x-auth-token") }
+            .ifBlank { request.optString("token") }
+            .trim()
 
-        // Verify session token if provided and server token is set
-        if (token.isNotBlank() && sessionSecretToken.isNotBlank() && token != sessionSecretToken) {
+        val acceptedTokens = resolveAcceptedTokens()
+        if (token.isBlank() || (acceptedTokens.isNotEmpty() && token !in acceptedTokens)) {
             sendDataChannelJson(
                 channel,
                 JSONObject().apply {
                     put("reqId", reqId)
                     put("success", false)
-                    put("error", "رمز المصادقة السري غير مطابق (Unauthorized P2P Token)")
+                    put("error", "401 Unauthorized: Invalid or missing x-auth-token header")
                 }
             )
             return
@@ -2022,8 +2057,10 @@ class HomeServerForegroundService : Service() {
     companion object {
         const val ACTION_START_SERVER = "com.example.service.ACTION_START_SERVER"
         const val ACTION_STOP_SERVER = "com.example.service.ACTION_STOP_SERVER"
+        const val ACTION_UPDATE_AUTH_TOKEN = "com.example.service.ACTION_UPDATE_AUTH_TOKEN"
         const val ACTION_ENABLE_MEDIA_PROJECTION = "com.example.service.ACTION_ENABLE_MEDIA_PROJECTION"
         const val EXTRA_PORT = "extra_port"
+        const val EXTRA_AUTH_TOKEN = "extra_auth_token"
         const val EXTRA_PROJECTION_RESULT_CODE = "extra_projection_result_code"
         const val EXTRA_PROJECTION_DATA_INTENT = "extra_projection_data_intent"
 

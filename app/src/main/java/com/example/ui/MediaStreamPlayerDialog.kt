@@ -54,6 +54,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
 import com.example.model.RemoteFileItem
+import com.example.repository.AuthTokenManager
 
 @OptIn(UnstableApi::class)
 @Composable
@@ -66,14 +67,17 @@ fun MediaStreamPlayerDialog(
     val context = LocalContext.current
     var isBuffering by remember { mutableStateOf(true) }
     var playbackError by remember { mutableStateOf<String?>(null) }
+    val effectiveToken = remember(secretToken) {
+        secretToken.trim().ifBlank { AuthTokenManager.getSavedAuthToken(context) }
+    }
 
-    val exoPlayer = remember(streamUrl, secretToken) {
+    val exoPlayer = remember(streamUrl, effectiveToken) {
         val httpDataSourceFactory = DefaultHttpDataSource.Factory()
             .setAllowCrossProtocolRedirects(true)
             .setConnectTimeoutMs(15_000)
             .setReadTimeoutMs(30_000)
             .setDefaultRequestProperties(
-                mapOf("x-auth-token" to secretToken)
+                AuthTokenManager.buildAuthHeaders(effectiveToken)
             )
 
         val mediaSourceFactory = DefaultMediaSourceFactory(context)

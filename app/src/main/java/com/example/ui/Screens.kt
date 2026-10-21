@@ -1095,10 +1095,15 @@ fun HomeNodeServerScreen(
     nodeInfo: HomeNodeInfo?,
     logs: List<ServerLog>,
     statusMessage: String?,
+    authToken: String = "",
+    isAuthTokenDialogOpen: Boolean = false,
     isMediaProjectionEnabled: Boolean = false,
     webRtcStateText: String = "",
     onStartServer: () -> Unit = {},
     onStopServer: () -> Unit = {},
+    onUpdateAuthToken: (String, Boolean) -> Unit = { _, _ -> },
+    onOpenAuthTokenDialog: () -> Unit = {},
+    onCloseAuthTokenDialog: () -> Unit = {},
     onRequestMediaProjection: () -> Unit = {},
     onClearLogs: () -> Unit,
     onBackToModeSelector: () -> Unit
@@ -1145,6 +1150,18 @@ fun HomeNodeServerScreen(
                         }
                     },
                     actions = {
+                        IconButton(
+                            onClick = onOpenAuthTokenDialog,
+                            modifier = Modifier
+                                .size(48.dp)
+                                .testTag("server_auth_token_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Key,
+                                contentDescription = "إعدادات رمز المصادقة (x-auth-token)",
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
                         IconButton(
                             onClick = onClearLogs,
                             modifier = Modifier
@@ -1273,21 +1290,32 @@ fun HomeNodeServerScreen(
 
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween,
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                Icon(
-                                    imageVector = Icons.Default.Key,
-                                    contentDescription = "رمز الجلسة",
-                                    tint = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = "رمز الأمان (x-auth-token): ${nodeInfo.secretToken.take(16)}...",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    fontFamily = FontFamily.Monospace,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Key,
+                                        contentDescription = "رمز الجلسة",
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "رمز الأمان (x-auth-token): ${authToken.ifBlank { nodeInfo.secretToken }}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                                TextButton(onClick = onOpenAuthTokenDialog) {
+                                    Text("تعديل التوكن")
+                                }
                             }
 
                             // Screen Mirroring & WebRTC MediaProjection Quick Control
@@ -1416,6 +1444,21 @@ fun HomeNodeServerScreen(
                     }
                 }
             }
+        }
+
+        if (isAuthTokenDialogOpen) {
+            AuthTokenSettingsDialog(
+                currentToken = authToken.ifBlank { nodeInfo?.secretToken.orEmpty() },
+                cloudSuggestedToken = nodeInfo?.secretToken.orEmpty(),
+                onSaveToken = { updated -> onUpdateAuthToken(updated, true) },
+                onSyncFromCloud = {
+                    val cloudTok = nodeInfo?.secretToken.orEmpty()
+                    if (cloudTok.isNotBlank()) {
+                        onUpdateAuthToken(cloudTok, true)
+                    }
+                },
+                onDismiss = onCloseAuthTokenDialog
+            )
         }
     }
 }
@@ -1610,6 +1653,8 @@ private fun ConsoleLogItemRow(log: ServerLog) {
 @Composable
 fun AdminControllerScreen(
     discoveredNode: HomeNodeInfo?,
+    authToken: String = "",
+    isAuthTokenDialogOpen: Boolean = false,
     isP2pConnected: Boolean = false,
     p2pConnectionStatus: String = "",
     remoteFiles: List<RemoteFileItem>,
@@ -1625,6 +1670,10 @@ fun AdminControllerScreen(
     onNavigateUp: () -> Unit,
     onBackToModeSelector: () -> Unit,
     onRefreshConnection: () -> Unit,
+    onUpdateAuthToken: (String, Boolean) -> Unit = { _, _ -> },
+    onSyncAuthTokenFromCloud: () -> Unit = {},
+    onOpenAuthTokenDialog: () -> Unit = {},
+    onCloseAuthTokenDialog: () -> Unit = {},
     onNavigateToDirectory: (String) -> Unit,
     onFileItemClick: (RemoteFileItem) -> Unit,
     onStreamFileClick: (RemoteFileItem) -> Unit,
@@ -1702,6 +1751,22 @@ fun AdminControllerScreen(
                     },
                     actions = {
                         IconButton(
+                            onClick = onOpenAuthTokenDialog,
+                            modifier = Modifier
+                                .size(48.dp)
+                                .testTag("auth_token_settings_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Key,
+                                contentDescription = "إعدادات رمز المصادقة (x-auth-token)",
+                                tint = if (authToken.isBlank()) {
+                                    MaterialTheme.colorScheme.error
+                                } else {
+                                    MaterialTheme.colorScheme.primary
+                                }
+                            )
+                        }
+                        IconButton(
                             onClick = onOpenScreenMirroring,
                             modifier = Modifier
                                 .size(48.dp)
@@ -1730,7 +1795,14 @@ fun AdminControllerScreen(
             floatingActionButton = {
                 if (discoveredNode?.isOnline == true) {
                     ExtendedFloatingActionButton(
-                        onClick = { uploadFileLauncher.launch("*/*") },
+                        onClick = {
+                            if (authToken.isBlank()) {
+                                onUpdateAuthToken("", false)
+                                onOpenAuthTokenDialog()
+                            } else {
+                                uploadFileLauncher.launch("*/*")
+                            }
+                        },
                         icon = {
                             Icon(
                                 imageVector = Icons.Default.CloudUpload,
@@ -1754,6 +1826,15 @@ fun AdminControllerScreen(
                 HomeNodeDiscoveryHeaderCard(
                     node = discoveredNode,
                     onOpenScreenMirroring = onOpenScreenMirroring
+                )
+
+                // 1a. Dedicated Auth Token (x-auth-token) Quick Input & Auto-Save Bar
+                AuthTokenQuickInputCard(
+                    currentToken = authToken,
+                    cloudSuggestedToken = discoveredNode?.secretToken.orEmpty(),
+                    onTokenChanged = { updated -> onUpdateAuthToken(updated, false) },
+                    onSyncFromCloud = onSyncAuthTokenFromCloud,
+                    onOpenSettingsModal = onOpenAuthTokenDialog
                 )
 
                 // 1b. Real-Time WebRTC & DataChannel State Notification Bar (connecting, open, failed)
@@ -2002,12 +2083,273 @@ fun AdminControllerScreen(
                 MediaStreamPlayerDialog(
                     mediaItem = activeStreamMedia,
                     streamUrl = streamUrl,
-                    secretToken = discoveredNode.secretToken,
+                    secretToken = authToken.ifBlank { discoveredNode.secretToken },
                     onDismiss = onCloseStreamPlayer
                 )
             }
         }
+
+        // Auth Token Settings Popup Modal (localStorage x-auth-token configuration)
+        if (isAuthTokenDialogOpen) {
+            AuthTokenSettingsDialog(
+                currentToken = authToken,
+                cloudSuggestedToken = discoveredNode?.secretToken.orEmpty(),
+                onSaveToken = { updated -> onUpdateAuthToken(updated, true) },
+                onSyncFromCloud = onSyncAuthTokenFromCloud,
+                onDismiss = onCloseAuthTokenDialog
+            )
+        }
     }
+}
+
+@Composable
+private fun AuthTokenQuickInputCard(
+    currentToken: String,
+    cloudSuggestedToken: String,
+    onTokenChanged: (String) -> Unit,
+    onSyncFromCloud: () -> Unit,
+    onOpenSettingsModal: () -> Unit
+) {
+    var draftToken by rememberSaveable(currentToken) { mutableStateOf(currentToken) }
+    val focusManager = LocalFocusManager.current
+    val isTokenMissing = draftToken.trim().isEmpty()
+
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = if (isTokenMissing) {
+            MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.55f)
+        } else {
+            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
+        },
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("auth_token_quick_card")
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.Key,
+                        contentDescription = null,
+                        tint = if (isTokenMissing) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.primary
+                        },
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = if (isTokenMissing) {
+                            "مطلوب: أدخل رمز المصادقة (x-auth-token)"
+                        } else {
+                            "ترويسة المصادقة (x-auth-token • محفوظ في localStorage)"
+                        },
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = if (isTokenMissing) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.onSurface
+                        }
+                    )
+                }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    if (cloudSuggestedToken.isNotBlank() && cloudSuggestedToken != draftToken.trim()) {
+                        TextButton(
+                            onClick = {
+                                draftToken = cloudSuggestedToken
+                                onSyncFromCloud()
+                            },
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                            modifier = Modifier.testTag("sync_auth_token_button")
+                        ) {
+                            Text("مزامنة تلقائية", style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                    TextButton(
+                        onClick = onOpenSettingsModal,
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                        modifier = Modifier.testTag("open_auth_dialog_button")
+                    ) {
+                        Text("الإعدادات", style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedTextField(
+                    value = draftToken,
+                    onValueChange = { newValue ->
+                        draftToken = newValue
+                        onTokenChanged(newValue)
+                    },
+                    placeholder = {
+                        Text(
+                            text = "أدخل رمز المصادقة السري (Auth Token)...",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    },
+                    singleLine = true,
+                    textStyle = MaterialTheme.typography.bodySmall.copy(
+                        fontFamily = FontFamily.Monospace
+                    ),
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Ascii,
+                        imeAction = ImeAction.Done
+                    ),
+                    keyboardActions = KeyboardActions(
+                        onDone = {
+                            focusManager.clearFocus()
+                            onTokenChanged(draftToken)
+                        }
+                    ),
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("auth_token_input")
+                )
+
+                FilledTonalButton(
+                    onClick = {
+                        focusManager.clearFocus()
+                        onTokenChanged(draftToken)
+                    },
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.testTag("save_auth_token_button")
+                ) {
+                    Text("حفظ")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun AuthTokenSettingsDialog(
+    currentToken: String,
+    cloudSuggestedToken: String,
+    onSaveToken: (String) -> Unit,
+    onSyncFromCloud: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    var tokenInput by rememberSaveable(currentToken) { mutableStateOf(currentToken) }
+    val isBlank = tokenInput.trim().isEmpty()
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = {
+            Icon(
+                imageVector = Icons.Default.Key,
+                contentDescription = null,
+                tint = if (isBlank) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+            )
+        },
+        title = {
+            Text(
+                text = "إعدادات رمز المصادقة (x-auth-token)",
+                fontWeight = FontWeight.Bold
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    text = "يتم حفظ رمز المصادقة تلقائياً في localStorage وإرساله في جميع طلبات HTTP والنفق السحابي:",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = Color(0xFF0F172A),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "headers: {\n  'Content-Type': 'application/json',\n  'x-auth-token': '${tokenInput.trim().ifBlank { "<يرجى إدخال التوكن>" }}'\n}",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = FontFamily.Monospace,
+                        color = Color(0xFF38BDF8),
+                        modifier = Modifier.padding(10.dp)
+                    )
+                }
+
+                if (isBlank) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.errorContainer,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = "تنبيه: لا يمكن إرسال طلبات استعراض الملفات أو التحكم إذا كان التوكن فارغاً. يرجى إدخال التوكن أولاً.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            modifier = Modifier.padding(10.dp)
+                        )
+                    }
+                }
+
+                OutlinedTextField(
+                    value = tokenInput,
+                    onValueChange = { tokenInput = it },
+                    label = { Text("رمز المصادقة (x-auth-token)") },
+                    placeholder = { Text("أدخل Auth Token...") },
+                    singleLine = true,
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(
+                        fontFamily = FontFamily.Monospace
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("dialog_auth_token_input")
+                )
+
+                if (cloudSuggestedToken.isNotBlank()) {
+                    OutlinedButton(
+                        onClick = {
+                            tokenInput = cloudSuggestedToken
+                            onSyncFromCloud()
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("dialog_sync_cloud_token_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.CloudDone,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("استخدام توكن هاتف المنزل تلقائياً")
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { onSaveToken(tokenInput) },
+                modifier = Modifier.testTag("dialog_save_auth_token_button")
+            ) {
+                Text("حفظ في localStorage")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("إغلاق")
+            }
+        }
+    )
 }
 
 @Composable
