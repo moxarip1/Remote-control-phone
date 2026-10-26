@@ -19,7 +19,7 @@ class SmartCloudRepositoryRuleTest : FirestoreEmulatorTestBase() {
         ipAddress = "192.168.1.50",
         port = 8080,
         isOnline = true,
-        secretToken = "token-secret-uuid-999",
+        secretToken = "local-only-token-never-sent-to-firestore",
         batteryLevel = 92,
         freeStorageBytes = 42_000_000_000L,
         totalStorageBytes = 128_000_000_000L,
@@ -27,7 +27,7 @@ class SmartCloudRepositoryRuleTest : FirestoreEmulatorTestBase() {
     )
 
     @Test
-    fun publishAndGetHomeNode_authenticatedOwner_succeeds() = runBlocking {
+    fun publishAndGetHomeNode_authenticatedOwner_succeedsWithoutPersistingSecretToken() = runBlocking {
         val aliceUid = signInTestUser(ALICE_EMAIL)
         val repository = SmartCloudRepository(firestore, auth)
         val node = sampleHomeNode()
@@ -45,6 +45,8 @@ class SmartCloudRepositoryRuleTest : FirestoreEmulatorTestBase() {
         assertNotNull(fetched)
         assertEquals("192.168.1.50", fetched?.ipAddress)
         assertEquals(true, fetched?.isOnline)
+        // Phase 1.6: Verify secretToken is NEVER persisted in Firestore
+        assertEquals("", fetched?.secretToken.orEmpty())
 
         val offlineResult = withTimeout(DEFAULT_TIMEOUT_MS) {
             repository.markHomeNodeOffline(node)
@@ -53,7 +55,7 @@ class SmartCloudRepositoryRuleTest : FirestoreEmulatorTestBase() {
     }
 
     @Test
-    fun observeHomeNode_authenticatedOwner_emitsRealtimeNodeInfo() = runBlocking {
+    fun observeHomeNode_authenticatedOwner_emitsRealtimeNodeInfoWithoutSecretToken() = runBlocking {
         val aliceUid = signInTestUser(ALICE_EMAIL)
         val repository = SmartCloudRepository(firestore, auth)
         val node = sampleHomeNode()
@@ -66,7 +68,8 @@ class SmartCloudRepositoryRuleTest : FirestoreEmulatorTestBase() {
             repository.observeHomeNode(aliceUid).first { it != null && it.ipAddress == "192.168.1.50" }
         }
         assertNotNull(observed)
-        assertEquals("token-secret-uuid-999", observed?.secretToken)
+        // Phase 1.6: secretToken is excluded from Firestore documents
+        assertEquals("", observed?.secretToken.orEmpty())
     }
 
     @Test

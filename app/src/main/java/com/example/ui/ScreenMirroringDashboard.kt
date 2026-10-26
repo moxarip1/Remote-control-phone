@@ -163,8 +163,8 @@ fun ScreenMirroringDashboard(
 
             val finalResult = if (p2pResult.isSuccess) {
                 p2pResult
-            } else {
-                // 2. Local loopback fallback when testing on same device or while ICE is connecting
+            } else if (AuthTokenManager.isLanDebugHttpEnabled(context)) {
+                // 2. Optional LAN HTTP Debug fallback only when explicitly enabled by the user
                 withContext(Dispatchers.IO) {
                     try {
                         val host = if (
@@ -185,12 +185,7 @@ fun ScreenMirroringDashboard(
 
                         screenshotHttpClient.newCall(req).execute().use { response ->
                             if (!response.isSuccessful) {
-                                val p2pFallback = p2pManager.requestScreenshotBitmapP2p(quality = 72, authToken = effectiveToken)
-                                if (p2pFallback.isSuccess) {
-                                    p2pFallback
-                                } else {
-                                    Result.failure(IllegalStateException("بانتظار اكتمال نفق WebRTC P2P..."))
-                                }
+                                p2pManager.requestScreenshotBitmapP2p(quality = 72, authToken = effectiveToken)
                             } else {
                                 val bytes = response.body?.bytes()
                                 if (bytes != null && bytes.isNotEmpty()) {
@@ -209,6 +204,8 @@ fun ScreenMirroringDashboard(
                         p2pManager.requestScreenshotBitmapP2p(quality = 72, authToken = effectiveToken)
                     }
                 }
+            } else {
+                p2pManager.requestScreenshotBitmapP2p(quality = 72, authToken = effectiveToken)
             }
 
             finalResult.onSuccess { bmp ->

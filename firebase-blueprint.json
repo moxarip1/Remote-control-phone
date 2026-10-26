@@ -2,7 +2,7 @@
   "entities": {
     "HomeNodeInfo": {
       "title": "HomeNodeInfo",
-      "description": "Represents the real-time global WebRTC P2P signaling, telemetry, and discovery state of a user's Home Node Server.",
+      "description": "Represents the real-time global WebRTC P2P signaling, telemetry, and discovery state of a user's Home Node Server. Does NOT store secretToken in Firestore (Phase 1.6).",
       "type": "object",
       "properties": {
         "userId": {
@@ -23,7 +23,7 @@
         },
         "port": {
           "type": "integer",
-          "description": "Logical port or channel identifier."
+          "description": "Logical port or channel identifier (1024..65535)."
         },
         "isOnline": {
           "type": "boolean",
@@ -32,10 +32,6 @@
         "p2pState": {
           "type": "string",
           "description": "Current WebRTC PeerConnection & RTCDataChannel status (e.g., WAITING_FOR_PEER, CONNECTING, P2P_CONNECTED)."
-        },
-        "secretToken": {
-          "type": "string",
-          "description": "Random session UUID token used to authenticate RTCDataChannel packets."
         },
         "batteryLevel": {
           "type": "integer",
@@ -68,7 +64,6 @@
         "userId",
         "deviceName",
         "isOnline",
-        "secretToken",
         "batteryLevel",
         "freeStorageBytes",
         "totalStorageBytes",

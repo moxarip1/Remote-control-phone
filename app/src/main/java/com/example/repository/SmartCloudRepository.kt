@@ -409,7 +409,6 @@ class SmartCloudRepository(
     private fun resolveEffectiveAuthToken(explicitToken: String, node: HomeNodeInfo): String {
         return explicitToken.trim()
             .ifBlank { AuthTokenManager.getSavedAuthToken() }
-            .ifBlank { node.secretToken.trim() }
     }
 
     suspend fun pingHomeNodeStatus(
@@ -424,9 +423,11 @@ class SmartCloudRepository(
             )
         }
 
-        if (p2pManager != null && p2pManager.isP2pConnected.value) {
+        if (p2pManager != null && (p2pManager.isP2pConnected.value || !AuthTokenManager.isLanDebugHttpEnabled())) {
             val p2pRes = p2pManager.requestNodeStatusP2p(node, resolvedToken)
-            if (p2pRes.isSuccess) return@withContext p2pRes
+            if (p2pRes.isSuccess || !AuthTokenManager.isLanDebugHttpEnabled()) {
+                return@withContext p2pRes
+            }
         }
 
         try {
@@ -490,13 +491,15 @@ class SmartCloudRepository(
             )
         }
 
-        // 1. Primary path: Global WebRTC P2P RTCDataChannel
-        if (p2pManager != null && p2pManager.isP2pConnected.value) {
+        // 1. Primary path: Encrypted WebRTC P2P RTCDataChannel (DTLS)
+        if (p2pManager != null && (p2pManager.isP2pConnected.value || !AuthTokenManager.isLanDebugHttpEnabled())) {
             val p2pResult = p2pManager.listRemoteFilesP2p(dirPath, resolvedToken)
-            if (p2pResult.isSuccess) return@withContext p2pResult
+            if (p2pResult.isSuccess || !AuthTokenManager.isLanDebugHttpEnabled()) {
+                return@withContext p2pResult
+            }
         }
 
-        // 2. Fallback / Local Loopback when testing on same device or while ICE is still negotiating
+        // 2. Optional LAN HTTP Debug fast-path (only active when user explicitly enabled LAN HTTP Debug Mode)
         try {
             val encodedPath = URLEncoder.encode(dirPath, "UTF-8")
             val url = "${resolveLoopbackBaseUrl(node)}/files?path=$encodedPath"
@@ -521,7 +524,7 @@ class SmartCloudRepository(
                 val json = JSONObject(bodyStr)
                 val currentPath = json.optString("currentPath", dirPath)
                 val parentPath = json.optString("parentPath", "")
-                val rootPath = json.optString("rootPath", currentPath)
+                val rootPath = json.optString("rootPath", "")
                 val filesJson = json.optJSONArray("files") ?: JSONArray()
 
                 val items = buildList {
@@ -572,7 +575,7 @@ class SmartCloudRepository(
         }
 
         val p2pManager = com.example.webrtc.WebRtcP2pClientManager.getInstance(context)
-        if (p2pManager.isP2pConnected.value) {
+        if (p2pManager.isP2pConnected.value || !AuthTokenManager.isLanDebugHttpEnabled(context)) {
             val p2pRes = p2pManager.downloadRemoteFileP2p(
                 context = context,
                 fileItem = fileItem,
@@ -580,7 +583,9 @@ class SmartCloudRepository(
                 authToken = resolvedToken,
                 onProgress = onProgress
             )
-            if (p2pRes.isSuccess) return@withContext p2pRes
+            if (p2pRes.isSuccess || !AuthTokenManager.isLanDebugHttpEnabled(context)) {
+                return@withContext p2pRes
+            }
         }
 
         try {
@@ -615,19 +620,19 @@ class SmartCloudRepository(
                     ?: body.contentLength().takeIf { it > 0 }
                     ?: fileItem.sizeBytes
 
-                val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                val downloadsDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
                     ?.takeIf { it.exists() || it.mkdirs() }
-                    ?: context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
                     ?: context.filesDir
 
-                val destFile = File(downloadsDir, fileItem.name)
+                val safeName = fileItem.name.replace("/", "_").replace("\\", "_")
+                val destFile = File(downloadsDir, safeName)
                 var transferred = 0L
                 val buffer = ByteArray(64 * 1024)
 
                 onProgress(
                     TransferProgress(
                         isActive = true,
-                        fileName = fileItem.name,
+                        fileName = safeName,
                         isUpload = false,
                         bytesTransferred = 0L,
                         totalBytes = totalBytes,
@@ -645,7 +650,7 @@ class SmartCloudRepository(
                             onProgress(
                                 TransferProgress(
                                     isActive = true,
-                                    fileName = fileItem.name,
+                                    fileName = safeName,
                                     isUpload = false,
                                     bytesTransferred = transferred,
                                     totalBytes = totalBytes,
@@ -691,7 +696,7 @@ class SmartCloudRepository(
         }
 
         val p2pManager = com.example.webrtc.WebRtcP2pClientManager.getInstance(context)
-        if (p2pManager.isP2pConnected.value) {
+        if (p2pManager.isP2pConnected.value || !AuthTokenManager.isLanDebugHttpEnabled(context)) {
             val p2pRes = p2pManager.uploadFileToHomeNodeP2p(
                 context = context,
                 targetDirPath = targetDirPath,
@@ -699,7 +704,9 @@ class SmartCloudRepository(
                 authToken = resolvedToken,
                 onProgress = onProgress
             )
-            if (p2pRes.isSuccess) return@withContext p2pRes
+            if (p2pRes.isSuccess || !AuthTokenManager.isLanDebugHttpEnabled(context)) {
+                return@withContext p2pRes
+            }
         }
 
         try {
@@ -809,9 +816,11 @@ class SmartCloudRepository(
             )
         }
 
-        if (p2pManager != null && p2pManager.isP2pConnected.value) {
+        if (p2pManager != null && (p2pManager.isP2pConnected.value || !AuthTokenManager.isLanDebugHttpEnabled())) {
             val p2pRes = p2pManager.deleteRemoteFileP2p(targetPath, resolvedToken)
-            if (p2pRes.isSuccess) return@withContext p2pRes
+            if (p2pRes.isSuccess || !AuthTokenManager.isLanDebugHttpEnabled()) {
+                return@withContext p2pRes
+            }
         }
 
         try {
@@ -849,13 +858,10 @@ class SmartCloudRepository(
 
     fun buildStreamUrl(
         node: HomeNodeInfo,
-        fileItem: RemoteFileItem,
-        authToken: String = ""
+        fileItem: RemoteFileItem
     ): String {
-        val resolvedToken = resolveEffectiveAuthToken(authToken, node)
         val encodedPath = URLEncoder.encode(fileItem.path, "UTF-8")
-        val encodedToken = URLEncoder.encode(resolvedToken, "UTF-8")
-        return "${resolveLoopbackBaseUrl(node)}/stream?path=$encodedPath&x-auth-token=$encodedToken"
+        return "${resolveLoopbackBaseUrl(node)}/stream?path=$encodedPath"
     }
 
     private companion object {

@@ -22,7 +22,6 @@ function validNodePayload(uid, overrides = {}) {
     ipAddress: "192.168.1.45",
     port: 8080,
     isOnline: true,
-    secretToken: "token-uuid-12345",
     batteryLevel: 88,
     freeStorageBytes: 32000000000,
     totalStorageBytes: 64000000000,
@@ -72,7 +71,7 @@ test("Unauthenticated user cannot read or write home_node", async () => {
   );
 });
 
-test("Authenticated owner can create, read, update, and delete their own home_node", async () => {
+test("Authenticated owner can create, read, update, and delete their own home_node without secretToken", async () => {
   const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
   const docRef = aliceDb.collection("users").doc(ALICE_UID).collection("home_node").doc("main");
   const initial = validNodePayload(ALICE_UID);
@@ -108,9 +107,12 @@ test("Cross-user access is strictly denied for read, update, and delete", async 
   await assertFails(aliceDocFromBob.delete());
 });
 
-test("Shadow update with ghost field or invalid port/battery fails validation", async () => {
+test("Shadow update with ghost field, secretToken leak, or invalid port/battery fails validation", async () => {
   const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
   const docRef = aliceDb.collection("users").doc(ALICE_UID).collection("home_node").doc("main");
+
+  // Phase 1.6: Writing secretToken to Firestore is strictly forbidden
+  await assertFails(docRef.set(validNodePayload(ALICE_UID, { secretToken: "leaked-token" })));
 
   // Ghost field on create
   await assertFails(docRef.set(validNodePayload(ALICE_UID, { isVerifiedAdmin: true })));

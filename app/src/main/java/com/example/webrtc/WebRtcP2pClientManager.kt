@@ -931,8 +931,6 @@ class WebRtcP2pClientManager private constructor(
             put("reqId", reqId)
             put("action", action)
             put("headers", buildHeadersJson(resolvedToken))
-            put("x-auth-token", resolvedToken)
-            put("token", resolvedToken)
         }
 
         val deferred = CompletableDeferred<JSONObject>()
@@ -976,7 +974,7 @@ class WebRtcP2pClientManager private constructor(
         node: HomeNodeInfo,
         authToken: String = ""
     ): Result<HomeNodeInfo> {
-        val resolvedToken = resolveEffectiveToken(authToken.ifBlank { node.secretToken })
+        val resolvedToken = resolveEffectiveToken(authToken)
         if (resolvedToken.isBlank()) {
             return Result.failure(
                 IllegalStateException("يرجى إدخال رمز المصادقة (x-auth-token) أولاً قبل إرسال الطلبات")
@@ -1030,7 +1028,8 @@ class WebRtcP2pClientManager private constructor(
                         path = obj.optString("path"),
                         isDirectory = obj.optBoolean("isDirectory", false),
                         sizeBytes = obj.optLong("sizeBytes", 0L),
-                        lastModified = obj.optLong("lastModified", 0L)
+                        lastModified = obj.optLong("lastModified", 0L),
+                        mimeType = obj.optString("mimeType", "")
                     )
                 )
             }
@@ -1087,12 +1086,12 @@ class WebRtcP2pClientManager private constructor(
         val targetDir = if (saveToCacheForStreaming) {
             File(context.cacheDir, "p2p_stream_cache").apply { mkdirs() }
         } else {
-            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
                 ?.takeIf { it.exists() || it.mkdirs() }
-                ?: context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
-                ?: context.filesDir
+                ?: File(context.filesDir, "downloads").apply { mkdirs() }
         }
-        val targetFile = File(targetDir, fileItem.name)
+        val safeLocalName = fileItem.name.replace(Regex("[\\\\/:*?\"<>|]"), "_").ifBlank { "downloaded_file" }
+        val targetFile = File(targetDir, safeLocalName)
         val outputStream = try {
             FileOutputStream(targetFile)
         } catch (e: Throwable) {
@@ -1116,8 +1115,6 @@ class WebRtcP2pClientManager private constructor(
             put("action", "/download")
             put("path", fileItem.path)
             put("headers", buildHeadersJson(resolvedToken))
-            put("x-auth-token", resolvedToken)
-            put("token", resolvedToken)
         }
 
         val bytes = cmd.toString().toByteArray(StandardCharsets.UTF_8)
@@ -1223,8 +1220,6 @@ class WebRtcP2pClientManager private constructor(
                         put("uploadId", uploadId)
                         put("data", b64)
                         put("headers", buildHeadersJson(resolvedToken))
-                        put("x-auth-token", resolvedToken)
-                        put("token", resolvedToken)
                     }
                     val rawBytes = chunkMsg.toString().toByteArray(StandardCharsets.UTF_8)
                     dc.send(DataChannel.Buffer(ByteBuffer.wrap(rawBytes), false))

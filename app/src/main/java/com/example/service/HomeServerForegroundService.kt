@@ -46,7 +46,12 @@ import com.example.model.RemoteFileItem
 import com.example.model.ServerLog
 import com.example.repository.AuthTokenManager
 import com.example.repository.SmartCloudRepository
+import com.example.server.FileCommandHandler
 import com.example.server.LocalFileServer
+import com.example.storage.SharedRootsRepository
+import com.example.storage.StorageAccessDeniedException
+import com.example.storage.StorageFileNotFoundException
+import com.example.storage.StorageGateway
 import com.example.webrtc.WebRtcP2pClientManager
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.database.DataSnapshot
@@ -116,8 +121,22 @@ class HomeServerForegroundService : Service() {
 
     private var localFileServer: LocalFileServer? = null
     private var repository: SmartCloudRepository? = null
-    private var sessionSecretToken: String = UUID.randomUUID().toString()
+    private var sessionSecretToken: String = ""
     private var activePort: Int = LocalFileServer.DEFAULT_PORT
+
+    private val storageGateway: StorageGateway by lazy {
+        StorageGateway.fromContext(applicationContext)
+    }
+
+    private val fileCommandHandler: FileCommandHandler by lazy {
+        FileCommandHandler(
+            storageGateway = storageGateway,
+            validTokensProvider = { resolveAcceptedTokens() },
+            statusProvider = { readHardwareStatus() },
+            screenshotBitmapProvider = { captureHomeNodeScreenBitmap() },
+            onLog = { logItem -> appendLog(logItem) }
+        )
+    }
 
     // WebRTC P2P Engine Components (Shared Factory + Global RTCDataChannel + Video Stream)
     private val webRtcLock = Any()
@@ -152,7 +171,9 @@ class HomeServerForegroundService : Service() {
 
     private data class IncomingUploadSession(
         val uploadId: String,
-        val targetFile: File,
+        val dirPath: String,
+        val fileName: String,
+        val tempFile: File,
         val outputStream: FileOutputStream,
         var receivedBytes: Long = 0L
     )
@@ -163,6 +184,10 @@ class HomeServerForegroundService : Service() {
         super.onCreate()
         try {
             repository = SmartCloudRepository(applicationContext)
+        } catch (_: Throwable) {
+        }
+        try {
+            SharedRootsRepository.validateAndLoadRoots(applicationContext)
         } catch (_: Throwable) {
         }
         createNotificationChannel()
@@ -191,12 +216,17 @@ class HomeServerForegroundService : Service() {
                         ServerLog(
                             method = "AUTH",
                             endpoint = "/x-auth-token",
-                            message = "تم تحديث رمز المصادقة (x-auth-token) ومزامنته مع السحابة"
+                            message = "تم تحديث رمز المصادقة (x-auth-token) في Keystore المشفر"
                         )
                     )
-                    serviceScope.launch {
-                        syncNodeStateWithCloud(isOnline = _isRunning.value)
-                    }
+                }
+            }
+
+            ACTION_SET_LAN_DEBUG_MODE -> {
+                val enabled = intent.getBooleanExtra(EXTRA_LAN_DEBUG_ENABLED, false)
+                AuthTokenManager.setLanDebugHttpEnabled(applicationContext, enabled)
+                serviceScope.launch {
+                    startLocalHttpServerWithFallback(activePort)
                 }
             }
 
@@ -310,8 +340,12 @@ class HomeServerForegroundService : Service() {
         if (sessionSecretToken.isNotBlank()) tokens.add(sessionSecretToken.trim())
         val saved = AuthTokenManager.getSavedAuthToken(applicationContext)
         if (saved.isNotBlank()) tokens.add(saved)
-        val currentCloudToken = _currentNodeInfo.value?.secretToken?.trim().orEmpty()
-        if (currentCloudToken.isNotBlank()) tokens.add(currentCloudToken)
+        if (AuthTokenManager.isLanDebugHttpEnabled(applicationContext)) {
+            val lanSessionToken = AuthTokenManager.lanDebugSessionTokenFlow.value.trim()
+            if (lanSessionToken.isNotBlank()) {
+                tokens.add(lanSessionToken)
+            }
+        }
         return tokens
     }
 
@@ -328,20 +362,20 @@ class HomeServerForegroundService : Service() {
         val signalingPath = if (uid.isNotBlank()) "users/$uid/signaling" else "users/{uid}/signaling"
         _webRtcStateText.value = "بانتظار ربط الآدمن عبر $signalingPath"
 
-        // Boot all hardware locks, file preparation, local HTTP server, and WebRTC signaling
+        // Boot all hardware locks, SAF validation, optional LAN HTTP server, and WebRTC signaling
         // asynchronously on Dispatchers.IO so the Main UI Thread never blocks or crashes.
         serverBootJob?.cancel()
         serverBootJob = serviceScope.launch {
             try {
                 acquireHardwareLocks()
-                ensureSampleCloudFilesIfNeeded()
+                SharedRootsRepository.validateAndLoadRoots(applicationContext)
                 startLocalHttpServerWithFallback(port)
 
                 appendLog(
                     ServerLog(
                         method = "WEBRTC-P2P",
                         endpoint = signalingPath,
-                        message = "تم تشغيل عقدة المنزل الذكية (WebRTC P2P + RTCDataChannel) عبر مسار الإشارات السحابي"
+                        message = "تم تشغيل عقدة المنزل الذكية المشفرة (DTLS WebRTC DataChannel) عبر مسار الإشارات السحابي"
                     )
                 )
 
@@ -353,7 +387,7 @@ class HomeServerForegroundService : Service() {
                     ServerLog(
                         method = "WARN",
                         endpoint = "/boot",
-                        message = "ملاحظة أثناء بدء الخادم المنزلي (يستمر الخادم بالعمل): ${t.localizedMessage ?: t.javaClass.simpleName}",
+                        message = "ملاحظة أثناء بدء الخادم المنزلي (يستمر الخادم بالعمل): ${t.javaClass.simpleName}",
                         isError = false
                     )
                 )
@@ -368,21 +402,35 @@ class HomeServerForegroundService : Service() {
         }
         localFileServer = null
 
+        if (!AuthTokenManager.isLanDebugHttpEnabled(applicationContext)) {
+            appendLog(
+                ServerLog(
+                    method = "SECURITY",
+                    endpoint = "/http-lan",
+                    message = "خادم HTTP المحلي معطل افتراضياً للأمان (يتم النقل حصرياً عبر قناة WebRTC DTLS المشفرة)"
+                )
+            )
+            return
+        }
+
+        AuthTokenManager.rotateLanDebugSessionToken()
         val candidatePorts = listOf(preferredPort, 8081, 8082, 8088, 8888).distinct()
         for (candidatePort in candidatePorts) {
             try {
                 val server = LocalFileServer(
                     serverPort = candidatePort,
-                    secretTokenProvider = { sessionSecretToken },
-                    validTokensProvider = { resolveAcceptedTokens() },
-                    statusProvider = { readHardwareStatus() },
-                    rootDirProvider = { resolveStorageRootDir() },
-                    screenshotBitmapProvider = { captureHomeNodeScreenBitmap() },
-                    onLog = { logItem -> appendLog(logItem) }
+                    commandHandler = fileCommandHandler
                 )
                 server.start(NanoHttpdSocketTimeoutMs, false)
                 localFileServer = server
                 activePort = candidatePort
+                appendLog(
+                    ServerLog(
+                        method = "WARN",
+                        endpoint = "/http-lan:$candidatePort",
+                        message = "وضع تصحيح الشبكة المحلية (LAN HTTP Debug Mode) مفعّل على المنفذ $candidatePort برمز جلسة عشوائي"
+                    )
+                )
                 return
             } catch (_: Throwable) {
                 // Try next port if address is already in use
@@ -1206,114 +1254,38 @@ class HomeServerForegroundService : Service() {
         val reqId = request.optString("reqId")
         val action = request.optString("action")
         val headersObj = request.optJSONObject("headers")
-        val headerToken = headersObj?.optString("x-auth-token")?.ifBlank { headersObj.optString("X-Auth-Token") }.orEmpty()
-        val token = headerToken
-            .ifBlank { request.optString("x-auth-token") }
-            .ifBlank { request.optString("token") }
-            .trim()
+        // Header-only token extraction (never accept query/top-level 'token' field)
+        val headerToken = headersObj?.optString("x-auth-token")
+            ?.ifBlank { headersObj.optString("X-Auth-Token") }
+            ?.trim()
 
-        val acceptedTokens = resolveAcceptedTokens()
-        if (token.isBlank() || (acceptedTokens.isNotEmpty() && token !in acceptedTokens)) {
-            sendDataChannelJson(
-                channel,
-                JSONObject().apply {
-                    put("reqId", reqId)
-                    put("success", false)
-                    put("error", "401 Unauthorized: Invalid or missing x-auth-token header")
-                }
-            )
+        if (!fileCommandHandler.isAuthorizedHeaderToken(headerToken, "P2P", action, "DataChannel")) {
+            sendDataChannelJson(channel, fileCommandHandler.unauthorizedResult(reqId).body)
             return
         }
 
         when (action) {
             "/status" -> {
-                val (battery, freeBytes, totalBytes) = readHardwareStatus()
-                val response = JSONObject().apply {
-                    put("reqId", reqId)
-                    put("success", true)
-                    put("batteryLevel", battery)
-                    put("freeStorageBytes", freeBytes)
-                    put("totalStorageBytes", totalBytes)
-                    put("timestamp", System.currentTimeMillis())
-                }
-                sendDataChannelJson(channel, response)
-                appendLog(
-                    ServerLog(
-                        method = "P2P",
-                        endpoint = "/status",
-                        message = "تم إرسال حالة البطارية والتخزين عبر RTCDataChannel"
-                    )
-                )
+                val res = fileCommandHandler.handleStatus(reqId = reqId, transportLabel = "P2P", clientId = "DataChannel")
+                sendDataChannelJson(channel, res.body)
             }
 
             "/files" -> {
                 val requestedPath = request.optString("path", "")
-                val rootDir = resolveStorageRootDir()
-                val targetDir = resolveSafeFile(rootDir, requestedPath)
-                if (targetDir == null || !targetDir.exists() || !targetDir.isDirectory) {
-                    sendDataChannelJson(
-                        channel,
-                        JSONObject().apply {
-                            put("reqId", reqId)
-                            put("success", false)
-                            put("error", "المجلد المطلوب غير موجود")
-                        }
-                    )
-                    return
-                }
-
-                val children = targetDir.listFiles()?.sortedWith(
-                    compareByDescending<File> { it.isDirectory }.thenBy { it.name.lowercase(Locale.ROOT) }
-                ).orEmpty()
-
-                val filesArray = JSONArray()
-                for (child in children) {
-                    filesArray.put(
-                        JSONObject().apply {
-                            put("name", child.name)
-                            put("path", child.absolutePath)
-                            put("isDirectory", child.isDirectory)
-                            put("sizeBytes", if (child.isDirectory) 0L else child.length())
-                            put("lastModified", child.lastModified())
-                        }
-                    )
-                }
-
-                val rootCanonical = try { rootDir.canonicalPath } catch (_: Throwable) { rootDir.absolutePath }
-                val currentCanonical = try { targetDir.canonicalPath } catch (_: Throwable) { targetDir.absolutePath }
-                val parentPath = if (currentCanonical != rootCanonical) {
-                    try { targetDir.parentFile?.canonicalPath.orEmpty() } catch (_: Throwable) { targetDir.parentFile?.absolutePath.orEmpty() }
-                } else {
-                    ""
-                }
-
-                val response = JSONObject().apply {
-                    put("reqId", reqId)
-                    put("success", true)
-                    put("currentPath", currentCanonical)
-                    put("parentPath", parentPath)
-                    put("rootPath", rootCanonical)
-                    put("files", filesArray)
-                }
-                sendDataChannelJson(channel, response)
-                appendLog(
-                    ServerLog(
-                        method = "P2P",
-                        endpoint = "/files",
-                        message = "تصفح مجلد P2P: ${targetDir.name} (${children.size} عنصر)"
-                    )
+                val res = fileCommandHandler.handleListFiles(
+                    rawPath = requestedPath,
+                    reqId = reqId,
+                    transportLabel = "P2P",
+                    clientId = "DataChannel"
                 )
+                sendDataChannelJson(channel, res.body)
             }
 
             "/screenshot" -> {
                 val quality = request.optInt("quality", 70).coerceIn(30, 95)
-                var bitmap: Bitmap? = null
-                try {
-                    bitmap = captureHomeNodeScreenBitmap()
-                    val baos = ByteArrayOutputStream()
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, quality, baos)
-                    val base64Jpeg = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
-
+                val jpegBytes = fileCommandHandler.captureScreenshotJpegBytes(quality)
+                if (jpegBytes != null) {
+                    val base64Jpeg = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
                     val response = JSONObject().apply {
                         put("reqId", reqId)
                         put("success", true)
@@ -1321,82 +1293,68 @@ class HomeServerForegroundService : Service() {
                         put("timestamp", System.currentTimeMillis())
                     }
                     sendDataChannelJson(channel, response)
-                } catch (e: Throwable) {
+                } else {
                     sendDataChannelJson(
                         channel,
-                        JSONObject().apply {
-                            put("reqId", reqId)
-                            put("success", false)
-                            put("error", e.localizedMessage ?: "فشل التقاط الشاشة")
-                        }
+                        fileCommandHandler.errorJsonResult(503, "فشل التقاط الشاشة", reqId).body
                     )
-                } finally {
-                    try {
-                        bitmap?.recycle()
-                    } catch (_: Throwable) {
-                    }
                 }
             }
 
             "/delete" -> {
                 val path = request.optString("path", "")
-                val rootDir = resolveStorageRootDir()
-                val targetFile = resolveSafeFile(rootDir, path)
-                val rootCanonical = try { rootDir.canonicalPath } catch (_: Throwable) { rootDir.absolutePath }
-                val targetCanonical = try { targetFile?.canonicalPath } catch (_: Throwable) { targetFile?.absolutePath }
-                if (targetFile == null || !targetFile.exists() || targetCanonical == rootCanonical) {
-                    sendDataChannelJson(
-                        channel,
-                        JSONObject().apply {
-                            put("reqId", reqId)
-                            put("success", false)
-                            put("error", "تعذر العثور على الملف أو لا يمكن حذف المجلد الجذري")
-                        }
-                    )
-                    return
-                }
-                val deleted = try { targetFile.deleteRecursively() } catch (_: Throwable) { false }
-                sendDataChannelJson(
-                    channel,
-                    JSONObject().apply {
-                        put("reqId", reqId)
-                        put("success", deleted)
-                        if (!deleted) put("error", "تعذر حذف الملف من وحدة التخزين")
-                    }
+                val res = fileCommandHandler.handleDelete(
+                    rawPath = path,
+                    reqId = reqId,
+                    transportLabel = "P2P",
+                    clientId = "DataChannel"
                 )
-                appendLog(
-                    ServerLog(
-                        method = "P2P",
-                        endpoint = "/delete",
-                        message = "حذف ملف عبر P2P: ${targetFile.name}",
-                        isError = !deleted
-                    )
-                )
+                sendDataChannelJson(channel, res.body)
             }
 
             "/download" -> {
                 val path = request.optString("path", "")
-                val rootDir = resolveStorageRootDir()
-                val targetFile = resolveSafeFile(rootDir, path)
-                if (targetFile == null || !targetFile.exists() || targetFile.isDirectory) {
+                val (stat, inputStream) = try {
+                    fileCommandHandler.openVerifiedReadStream(
+                        rawPath = path,
+                        transportLabel = "P2P",
+                        endpoint = "/download",
+                        clientId = "DataChannel"
+                    )
+                } catch (e: StorageAccessDeniedException) {
                     sendDataChannelJson(
                         channel,
                         JSONObject().apply {
                             put("reqId", reqId)
                             put("type", "download_error")
-                            put("error", "الملف المطلوب غير موجود أو أنه مجلد")
+                            put("statusCode", 403)
+                            put("error", e.message ?: "403 Forbidden: Access outside shared roots is denied")
+                        }
+                    )
+                    return
+                } catch (e: StorageFileNotFoundException) {
+                    sendDataChannelJson(
+                        channel,
+                        JSONObject().apply {
+                            put("reqId", reqId)
+                            put("type", "download_error")
+                            put("statusCode", 404)
+                            put("error", e.message ?: "404 Not Found: File does not exist")
+                        }
+                    )
+                    return
+                } catch (_: Throwable) {
+                    sendDataChannelJson(
+                        channel,
+                        JSONObject().apply {
+                            put("reqId", reqId)
+                            put("type", "download_error")
+                            put("statusCode", 500)
+                            put("error", "500 Internal Server Error")
                         }
                     )
                     return
                 }
-
-                appendLog(
-                    ServerLog(
-                        method = "P2P",
-                        endpoint = "/download",
-                        message = "بدء إرسال الملف عبر نفق P2P: ${targetFile.name} (${RemoteFileItem.formatBytes(targetFile.length())})"
-                    )
-                )
 
                 try {
                     sendDataChannelJson(
@@ -1404,15 +1362,15 @@ class HomeServerForegroundService : Service() {
                         JSONObject().apply {
                             put("reqId", reqId)
                             put("type", "download_start")
-                            put("fileName", targetFile.name)
-                            put("totalBytes", targetFile.length())
+                            put("fileName", stat.name)
+                            put("totalBytes", stat.sizeBytes)
                         }
                     )
 
                     val chunkBuf = ByteArray(24 * 1024)
-                    FileInputStream(targetFile).use { fis ->
+                    inputStream.use { stream ->
                         while (true) {
-                            val read = fis.read(chunkBuf)
+                            val read = stream.read(chunkBuf)
                             if (read <= 0) break
 
                             var backpressureWait = 0
@@ -1441,13 +1399,13 @@ class HomeServerForegroundService : Service() {
                             put("type", "download_end")
                         }
                     )
-                } catch (e: Throwable) {
+                } catch (_: Throwable) {
                     sendDataChannelJson(
                         channel,
                         JSONObject().apply {
                             put("reqId", reqId)
                             put("type", "download_error")
-                            put("error", e.localizedMessage ?: "انقطع تدفق الملف عبر P2P")
+                            put("error", "انقطع تدفق الملف عبر P2P")
                         }
                     )
                 }
@@ -1456,19 +1414,23 @@ class HomeServerForegroundService : Service() {
             "/upload_start" -> {
                 val uploadId = request.optString("uploadId")
                 val dirPath = request.optString("path")
-                val filename = request.optString("filename", "uploaded_${System.currentTimeMillis()}")
-                    .replace("/", "_")
-                    .replace("\\", "_")
-
-                val rootDir = resolveStorageRootDir()
-                val targetDir = resolveSafeFile(rootDir, dirPath)?.takeIf { it.exists() && it.isDirectory } ?: rootDir
-                val destFile = File(targetDir, filename)
+                val rawFilename = request.optString("filename", "uploaded_${System.currentTimeMillis()}")
 
                 try {
-                    val fos = FileOutputStream(destFile)
+                    // Pre-validate path and filename through StorageGateway before accepting chunks
+                    StorageGateway.validateAndParsePath(dirPath)
+                    val safeFilename = StorageGateway.validateSafeSingleFileName(rawFilename)
+
+                    val stagingDir = File(applicationContext.cacheDir, "p2p_upload_staging").apply {
+                        if (!exists()) mkdirs()
+                    }
+                    val tempFile = File(stagingDir, "upload_${UUID.randomUUID()}.part")
+                    val fos = FileOutputStream(tempFile)
                     activeUploads[uploadId] = IncomingUploadSession(
                         uploadId = uploadId,
-                        targetFile = destFile,
+                        dirPath = dirPath,
+                        fileName = safeFilename,
+                        tempFile = tempFile,
                         outputStream = fos
                     )
                     sendDataChannelJson(
@@ -1476,16 +1438,18 @@ class HomeServerForegroundService : Service() {
                         JSONObject().apply {
                             put("reqId", reqId)
                             put("success", true)
+                            put("statusCode", 200)
                         }
                     )
-                } catch (e: Throwable) {
+                } catch (e: StorageAccessDeniedException) {
                     sendDataChannelJson(
                         channel,
-                        JSONObject().apply {
-                            put("reqId", reqId)
-                            put("success", false)
-                            put("error", e.localizedMessage ?: "تعذر إنشاء الملف على هاتف المنزل")
-                        }
+                        fileCommandHandler.errorJsonResult(403, e.message ?: "403 Forbidden", reqId).body
+                    )
+                } catch (_: Throwable) {
+                    sendDataChannelJson(
+                        channel,
+                        fileCommandHandler.errorJsonResult(500, "تعذر تهيئة استلام الملف على هاتف المنزل", reqId).body
                     )
                 }
             }
@@ -1507,43 +1471,40 @@ class HomeServerForegroundService : Service() {
             "/upload_finish" -> {
                 val uploadId = request.optString("uploadId")
                 val session = activeUploads.remove(uploadId)
-                if (session != null) {
+                if (session == null) {
+                    sendDataChannelJson(
+                        channel,
+                        fileCommandHandler.errorJsonResult(404, "Upload session not found", reqId).body
+                    )
+                    return
+                }
+                try {
                     try {
                         session.outputStream.flush()
                         session.outputStream.close()
                     } catch (_: Throwable) {
                     }
-                    appendLog(
-                        ServerLog(
-                            method = "P2P",
-                            endpoint = "/upload",
-                            message = "اكتمال استلام ملف P2P: ${session.targetFile.name} (${RemoteFileItem.formatBytes(session.receivedBytes)})"
+                    FileInputStream(session.tempFile).use { fis ->
+                        val res = fileCommandHandler.handleUploadStream(
+                            rawDirPath = session.dirPath,
+                            rawFileName = session.fileName,
+                            inputStream = fis,
+                            expectedBytes = session.receivedBytes,
+                            reqId = reqId,
+                            transportLabel = "P2P",
+                            clientId = "DataChannel"
                         )
-                    )
-                }
-                sendDataChannelJson(
-                    channel,
-                    JSONObject().apply {
-                        put("reqId", reqId)
-                        put("success", true)
+                        sendDataChannelJson(channel, res.body)
                     }
-                )
+                } finally {
+                    try {
+                        if (session.tempFile.exists()) {
+                            session.tempFile.delete()
+                        }
+                    } catch (_: Throwable) {
+                    }
+                }
             }
-        }
-    }
-
-    private fun resolveSafeFile(rootDir: File, requestedPath: String): File? {
-        return try {
-            val rootCanonical = rootDir.canonicalFile
-            val candidate = if (requestedPath.isBlank()) {
-                rootCanonical
-            } else {
-                val raw = File(requestedPath)
-                if (raw.isAbsolute) raw.canonicalFile else File(rootCanonical, requestedPath).canonicalFile
-            }
-            if (candidate.path.startsWith(rootCanonical.path)) candidate else rootCanonical
-        } catch (_: Throwable) {
-            null
         }
     }
 
@@ -1706,7 +1667,7 @@ class HomeServerForegroundService : Service() {
             ipAddress = "WebRTC-P2P-Global",
             port = activePort,
             isOnline = isOnline,
-            secretToken = sessionSecretToken,
+            secretToken = "",
             batteryLevel = battery,
             freeStorageBytes = freeBytes,
             totalStorageBytes = totalBytes,
@@ -1820,96 +1781,13 @@ class HomeServerForegroundService : Service() {
             val battery = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
                 ?.takeIf { it in 0..100 } ?: 100
 
-            val rootDir = resolveStorageRootDir()
-            val statFs = StatFs(rootDir.absolutePath)
+            val statFs = StatFs(filesDir.absolutePath)
             val freeBytes = statFs.availableBytes
             val totalBytes = statFs.totalBytes
             Triple(battery, freeBytes, totalBytes)
         } catch (_: Throwable) {
             Triple(100, 0L, 0L)
         }
-    }
-
-    private fun resolveStorageRootDir(): File {
-        return try {
-            val externalRoot = Environment.getExternalStorageDirectory()
-            if (externalRoot != null && externalRoot.exists() && externalRoot.canRead() && !externalRoot.listFiles().isNullOrEmpty()) {
-                return externalRoot
-            }
-            val appExternal = getExternalFilesDir(null)
-            if (appExternal != null && appExternal.exists() && appExternal.canRead()) {
-                return appExternal
-            }
-            filesDir
-        } catch (_: Throwable) {
-            filesDir
-        }
-    }
-
-    private fun ensureSampleCloudFilesIfNeeded() {
-        try {
-            val root = resolveStorageRootDir()
-            val cloudFolder = File(root, "SmartHomeCloud_Shared")
-            if (!cloudFolder.exists()) {
-                cloudFolder.mkdirs()
-                File(cloudFolder, "Welcome_SmartHomeCloud.txt").writeText(
-                    "مرحباً بك في نظام السحابة المنزلية الذكية العالمي (Smart Home Cloud P2P)!\n" +
-                        "يعمل هذا الخادم الآن عبر نفق WebRTC P2P وقناة RTCDataChannel للوصول من أي شبكة في العالم (4G/5G/Wi-Fi)."
-                )
-                val docsDir = File(cloudFolder, "Documents").apply { mkdirs() }
-                File(docsDir, "Home_Server_Specs.json").writeText(
-                    "{\n  \"transport\": \"WebRTC P2P (RTCDataChannel + 30 FPS VideoTrack)\",\n  \"signaling\": \"Firebase users/{uid}/signaling\"\n}"
-                )
-                val mediaDir = File(cloudFolder, "Media_Samples").apply { mkdirs() }
-                createSampleWavFile(File(mediaDir, "SmartHome_Chime_Sample.wav"))
-            }
-        } catch (_: Throwable) {
-        }
-    }
-
-    private fun createSampleWavFile(target: File) {
-        if (target.exists()) return
-        val sampleRate = 8000
-        val durationSeconds = 3
-        val numSamples = sampleRate * durationSeconds
-        val dataSize = numSamples * 2
-        val totalDataLen = dataSize + 36
-        val byteRate = sampleRate * 2
-
-        FileOutputStream(target).use { out ->
-            val header = ByteArray(44)
-            header[0] = 'R'.code.toByte(); header[1] = 'I'.code.toByte(); header[2] = 'F'.code.toByte(); header[3] = 'F'.code.toByte()
-            writeIntLE(header, 4, totalDataLen)
-            header[8] = 'W'.code.toByte(); header[9] = 'A'.code.toByte(); header[10] = 'V'.code.toByte(); header[11] = 'E'.code.toByte()
-            header[12] = 'f'.code.toByte(); header[13] = 'm'.code.toByte(); header[14] = 't'.code.toByte(); header[15] = ' '.code.toByte()
-            writeIntLE(header, 16, 16)
-            header[20] = 1; header[21] = 0
-            header[22] = 1; header[23] = 0
-            writeIntLE(header, 24, sampleRate)
-            writeIntLE(header, 28, byteRate)
-            header[32] = 2; header[33] = 0
-            header[34] = 16; header[35] = 0
-            header[36] = 'd'.code.toByte(); header[37] = 'a'.code.toByte(); header[38] = 't'.code.toByte(); header[39] = 'a'.code.toByte()
-            writeIntLE(header, 40, dataSize)
-            out.write(header)
-
-            val pcm = ByteArray(dataSize)
-            for (i in 0 until numSamples) {
-                val freq = if (i < numSamples / 2) 440.0 else 554.37
-                val angle = 2.0 * Math.PI * i * freq / sampleRate
-                val sample = (Math.sin(angle) * 12000).toInt().toShort()
-                pcm[i * 2] = (sample.toInt() and 0xFF).toByte()
-                pcm[i * 2 + 1] = ((sample.toInt() shr 8) and 0xFF).toByte()
-            }
-            out.write(pcm)
-        }
-    }
-
-    private fun writeIntLE(buffer: ByteArray, offset: Int, value: Int) {
-        buffer[offset] = (value and 0xFF).toByte()
-        buffer[offset + 1] = ((value shr 8) and 0xFF).toByte()
-        buffer[offset + 2] = ((value shr 16) and 0xFF).toByte()
-        buffer[offset + 3] = ((value shr 24) and 0xFF).toByte()
     }
 
     private fun stopServerAndSelf() {
@@ -2058,9 +1936,11 @@ class HomeServerForegroundService : Service() {
         const val ACTION_START_SERVER = "com.example.service.ACTION_START_SERVER"
         const val ACTION_STOP_SERVER = "com.example.service.ACTION_STOP_SERVER"
         const val ACTION_UPDATE_AUTH_TOKEN = "com.example.service.ACTION_UPDATE_AUTH_TOKEN"
+        const val ACTION_SET_LAN_DEBUG_MODE = "com.example.service.ACTION_SET_LAN_DEBUG_MODE"
         const val ACTION_ENABLE_MEDIA_PROJECTION = "com.example.service.ACTION_ENABLE_MEDIA_PROJECTION"
         const val EXTRA_PORT = "extra_port"
         const val EXTRA_AUTH_TOKEN = "extra_auth_token"
+        const val EXTRA_LAN_DEBUG_ENABLED = "extra_lan_debug_enabled"
         const val EXTRA_PROJECTION_RESULT_CODE = "extra_projection_result_code"
         const val EXTRA_PROJECTION_DATA_INTENT = "extra_projection_data_intent"
 

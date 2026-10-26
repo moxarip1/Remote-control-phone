@@ -10,7 +10,6 @@ import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.activity.ComponentActivity
@@ -90,6 +89,9 @@ fun SmartHomeCloudRootApp(
     val isMediaProjectionEnabled by viewModel.isMediaProjectionEnabled.collectAsStateWithLifecycle()
     val webRtcStateText by viewModel.webRtcStateText.collectAsStateWithLifecycle()
 
+    val sharedRoots by viewModel.sharedRoots.collectAsStateWithLifecycle()
+    val isLanDebugHttpEnabled by viewModel.isLanDebugHttpEnabled.collectAsStateWithLifecycle()
+
     val isP2pConnected by viewModel.isP2pConnected.collectAsStateWithLifecycle()
     val p2pConnectionStatus by viewModel.p2pConnectionStatus.collectAsStateWithLifecycle()
 
@@ -106,41 +108,67 @@ fun SmartHomeCloudRootApp(
 
     var isNotificationSkipped by rememberSaveable { mutableStateOf(false) }
 
-    var permissionsState by remember(isNotificationSkipped) {
-        mutableStateOf(evaluateSystemPermissions(context, isNotificationSkipped))
+    var permissionsState by remember(isNotificationSkipped, sharedRoots) {
+        mutableStateOf(
+            evaluateSystemPermissions(
+                context = context,
+                hasSafSharedRoots = sharedRoots.isNotEmpty(),
+                isNotificationSkipped = isNotificationSkipped
+            )
+        )
     }
 
-    // Refresh permissions state whenever Activity resumes from system settings screens
-    DisposableEffect(lifecycleOwner, isNotificationSkipped) {
+    // Refresh permissions & SAF persisted roots whenever Activity resumes
+    DisposableEffect(lifecycleOwner, isNotificationSkipped, sharedRoots) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                permissionsState = evaluateSystemPermissions(context, isNotificationSkipped)
+                viewModel.refreshSharedRoots(context)
+                permissionsState = evaluateSystemPermissions(
+                    context = context,
+                    hasSafSharedRoots = viewModel.sharedRoots.value.isNotEmpty(),
+                    isNotificationSkipped = isNotificationSkipped
+                )
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    val legacyStorageLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestMultiplePermissions()
-    ) {
-        permissionsState = evaluateSystemPermissions(context, isNotificationSkipped)
+    // Storage Access Framework (ACTION_OPEN_DOCUMENT_TREE) folder picker launcher (Rule 0.3 & Phase 1.1)
+    val safFolderPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { treeUri ->
+        if (treeUri != null) {
+            viewModel.addSharedRootUri(context, treeUri, allowUploads = false)
+            permissionsState = evaluateSystemPermissions(
+                context = context,
+                hasSafSharedRoots = viewModel.sharedRoots.value.isNotEmpty(),
+                isNotificationSkipped = isNotificationSkipped
+            )
+        }
     }
 
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (!granted) {
-            // If user denies POST_NOTIFICATIONS, mark as skipped (silent mode) so it is never mandatory
             isNotificationSkipped = true
         }
-        permissionsState = evaluateSystemPermissions(context, isNotificationSkipped)
+        permissionsState = evaluateSystemPermissions(
+            context = context,
+            hasSafSharedRoots = sharedRoots.isNotEmpty(),
+            isNotificationSkipped = isNotificationSkipped
+        )
     }
 
     val settingsIntentLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) {
-        permissionsState = evaluateSystemPermissions(context, isNotificationSkipped)
+        permissionsState = evaluateSystemPermissions(
+            context = context,
+            hasSafSharedRoots = sharedRoots.isNotEmpty(),
+            isNotificationSkipped = isNotificationSkipped
+        )
     }
 
     val mediaProjectionLauncher = rememberLauncherForActivityResult(
@@ -186,40 +214,31 @@ fun SmartHomeCloudRootApp(
                 ModeSelectorScreen(
                     userEmail = currentUser?.email ?: currentUser?.displayName ?: "حساب السحابة المنزلية",
                     permissionsState = permissionsState,
+                    sharedRootsCount = sharedRoots.size,
                     discoveredHomeNode = discoveredNode,
                     isLocalServerRunning = isServerRunning,
                     onRequestStoragePermission = {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                            try {
-                                val intent = Intent(
-                                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                                    Uri.parse("package:${context.packageName}")
-                                )
-                                settingsIntentLauncher.launch(intent)
-                            } catch (_: Exception) {
-                                val fallback = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
-                                settingsIntentLauncher.launch(fallback)
-                            }
-                        } else {
-                            legacyStorageLauncher.launch(
-                                arrayOf(
-                                    Manifest.permission.READ_EXTERNAL_STORAGE,
-                                    Manifest.permission.WRITE_EXTERNAL_STORAGE
-                                )
-                            )
-                        }
+                        safFolderPickerLauncher.launch(null)
                     },
                     onRequestNotificationPermission = {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                         } else {
                             isNotificationSkipped = true
-                            permissionsState = evaluateSystemPermissions(context, isNotificationSkipped)
+                            permissionsState = evaluateSystemPermissions(
+                                context = context,
+                                hasSafSharedRoots = sharedRoots.isNotEmpty(),
+                                isNotificationSkipped = isNotificationSkipped
+                            )
                         }
                     },
                     onSkipNotificationPermission = {
                         isNotificationSkipped = true
-                        permissionsState = evaluateSystemPermissions(context, true)
+                        permissionsState = evaluateSystemPermissions(
+                            context = context,
+                            hasSafSharedRoots = sharedRoots.isNotEmpty(),
+                            isNotificationSkipped = true
+                        )
                     },
                     onRequestBatteryOptimizationExemption = {
                         try {
@@ -246,6 +265,17 @@ fun SmartHomeCloudRootApp(
                     webRtcStateText = webRtcStateText,
                     authToken = savedAuthToken,
                     isAuthTokenDialogOpen = isAuthTokenDialogOpen,
+                    sharedRoots = sharedRoots,
+                    isLanDebugHttpEnabled = isLanDebugHttpEnabled,
+                    onAddSharedRoot = { safFolderPickerLauncher.launch(null) },
+                    onRemoveSharedRoot = { rootId -> viewModel.removeSharedRoot(context, rootId) },
+                    onToggleRootAllowUploads = { rootId, allow ->
+                        viewModel.setRootAllowUploads(context, rootId, allow)
+                    },
+                    onToggleLanDebugHttp = { enabled ->
+                        viewModel.setLanDebugHttpEnabled(context, enabled)
+                    },
+                    onRotateAuthToken = { viewModel.generateAndSaveNew32ByteToken() },
                     onUpdateAuthToken = { newToken, closeDialog ->
                         viewModel.updateAuthToken(newToken, closeDialog)
                     },
@@ -316,17 +346,9 @@ fun SmartHomeCloudRootApp(
 
 private fun evaluateSystemPermissions(
     context: Context,
+    hasSafSharedRoots: Boolean,
     isNotificationSkipped: Boolean = false
 ): SystemPermissionsState {
-    val hasStorage = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-        Environment.isExternalStorageManager()
-    } else {
-        ContextCompat.checkSelfPermission(
-            context,
-            Manifest.permission.READ_EXTERNAL_STORAGE
-        ) == PackageManager.PERMISSION_GRANTED
-    }
-
     val hasNotifications = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         ContextCompat.checkSelfPermission(
             context,
@@ -340,7 +362,7 @@ private fun evaluateSystemPermissions(
     val ignoringBatteryOpt = pm?.isIgnoringBatteryOptimizations(context.packageName) ?: true
 
     return SystemPermissionsState(
-        hasStorageAccess = hasStorage,
+        hasStorageAccess = hasSafSharedRoots,
         hasNotificationPermission = hasNotifications,
         isIgnoringBatteryOptimizations = ignoringBatteryOpt,
         isNotificationSkipped = isNotificationSkipped

@@ -1,30 +1,28 @@
 package com.example.server
 
-import android.graphics.Bitmap
-import com.example.model.RemoteFileItem
-import com.example.model.ServerLog
+import com.example.storage.StorageAccessDeniedException
+import com.example.storage.StorageFileNotFoundException
 import fi.iki.elonen.NanoHTTPD
-import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
-import java.io.File
-import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.io.InputStream
 import java.net.URLDecoder
 import java.net.URLEncoder
 
+/**
+ * Optional local HTTP server delegating all authentication and file operations to [FileCommandHandler].
+ *
+ * Security hardening (Phase 1):
+ * - Disabled by default; only started if the user explicitly enables "LAN HTTP Debug Mode" in settings.
+ * - Accepts `x-auth-token` strictly from HTTP request headers (never from query parameters `?token=` or `?x-auth-token=`).
+ * - Verifies tokens in constant time via [FileCommandHandler.isAuthorizedHeaderToken] and rejects when expected tokens are empty.
+ * - Does NOT emit `Access-Control-Allow-Origin: *`.
+ * - Routes `/files`, `/download`, `/upload`, `/delete`, and `/stream` through [FileCommandHandler] -> [com.example.storage.StorageGateway],
+ *   enforcing SAF shared roots and rejecting traversal or non-shared paths with `403 Forbidden`.
+ */
 class LocalFileServer(
     val serverPort: Int = DEFAULT_PORT,
-    private val secretTokenProvider: () -> String,
-    private val validTokensProvider: () -> Set<String> = {
-        setOf(secretTokenProvider().trim()).filter { it.isNotBlank() }.toSet()
-    },
-    private val statusProvider: () -> Triple<Int, Long, Long>,
-    private val rootDirProvider: () -> File,
-    private val screenshotBitmapProvider: () -> Bitmap? = { null },
-    private val onLog: (ServerLog) -> Unit
+    val commandHandler: FileCommandHandler
 ) : NanoHTTPD(serverPort) {
 
     override fun serve(session: IHTTPSession): Response {
@@ -32,128 +30,95 @@ class LocalFileServer(
         val uri = session.uri ?: "/"
         val method = session.method ?: Method.GET
 
-        if (method == Method.OPTIONS) {
-            return newFixedLengthResponse(Response.Status.OK, MIME_JSON, "{}").apply {
-                addHeader("Access-Control-Allow-Origin", "*")
-                addHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-                addHeader("Access-Control-Allow-Headers", "Content-Type, x-auth-token, X-Auth-Token")
-            }
-        }
-
-        // 1. Zero-Trust Session Token Verification via x-auth-token Header
-        val expectedTokens = validTokensProvider().map { it.trim() }.filter { it.isNotBlank() }.toSet()
+        // Extract x-auth-token strictly from HTTP request headers (NEVER from query string)
         val headerToken = session.headers.entries
-            .firstOrNull { it.key.equals("x-auth-token", ignoreCase = true) || it.key.equals("http_x_auth_token", ignoreCase = true) }
+            .firstOrNull {
+                it.key.equals("x-auth-token", ignoreCase = true) ||
+                    it.key.equals("http_x_auth_token", ignoreCase = true)
+            }
             ?.value
-        val providedToken = (headerToken
-            ?: getQueryParam(session, "x-auth-token")
-            ?: getQueryParam(session, "token")
-            ?: "").trim()
 
-        if (providedToken.isBlank() || (expectedTokens.isNotEmpty() && providedToken !in expectedTokens)) {
-            emitLog(
-                method = method.name,
-                endpoint = uri,
-                message = "رفض طلب غير مصرح به (401 Unauthorized) من $clientIp",
-                clientIp = clientIp,
-                statusCode = 401,
-                isError = true
-            )
-            return jsonResponse(
-                status = Response.Status.UNAUTHORIZED,
-                body = JSONObject()
-                    .put("success", false)
-                    .put("error", "401 Unauthorized: Invalid or missing x-auth-token header")
-            )
+        if (!commandHandler.isAuthorizedHeaderToken(headerToken, method.name, uri, clientIp)) {
+            val unauth = commandHandler.unauthorizedResult()
+            return jsonResponse(Response.Status.UNAUTHORIZED, unauth.body)
         }
 
         return try {
             when {
-                method == Method.GET && uri == "/status" -> handleStatusRequest(clientIp)
-                method == Method.GET && uri == "/screenshot" -> handleScreenshotRequest(session, clientIp)
-                method == Method.GET && uri == "/files" -> handleFilesListRequest(session, clientIp)
+                method == Method.GET && uri == "/status" -> {
+                    val res = commandHandler.handleStatus(transportLabel = "HTTP", clientId = clientIp)
+                    toNanoJsonResponse(res)
+                }
+                method == Method.GET && uri == "/screenshot" -> handleScreenshotRequest(session)
+                method == Method.GET && uri == "/files" -> {
+                    val rawPath = getQueryParam(session, "path")
+                    val res = commandHandler.handleListFiles(
+                        rawPath = rawPath,
+                        transportLabel = "HTTP",
+                        clientId = clientIp
+                    )
+                    toNanoJsonResponse(res)
+                }
                 method == Method.GET && uri == "/download" -> handleDownloadRequest(session, clientIp)
                 method == Method.POST && uri == "/upload" -> handleUploadRequest(session, clientIp)
-                method == Method.DELETE && uri == "/delete" -> handleDeleteRequest(session, clientIp)
+                method == Method.DELETE && uri == "/delete" -> {
+                    val rawPath = getQueryParam(session, "path")
+                    if (rawPath.isNullOrBlank()) {
+                        return toNanoJsonResponse(
+                            commandHandler.errorJsonResult(400, "400 Bad Request: Missing 'path' query parameter")
+                        )
+                    }
+                    val res = commandHandler.handleDelete(
+                        rawPath = rawPath,
+                        transportLabel = "HTTP",
+                        clientId = clientIp
+                    )
+                    toNanoJsonResponse(res)
+                }
                 method == Method.GET && uri == "/stream" -> handleStreamRequest(session, clientIp)
                 else -> {
-                    emitLog(
+                    commandHandler.emitSanitizedLog(
                         method = method.name,
                         endpoint = uri,
-                        message = "مسار غير موجود (404): $uri",
+                        message = "مسار غير موجود (404)",
                         clientIp = clientIp,
                         statusCode = 404,
                         isError = true
                     )
-                    jsonResponse(
-                        status = Response.Status.NOT_FOUND,
-                        body = JSONObject()
-                            .put("success", false)
-                            .put("error", "Endpoint not found: ${method.name} $uri")
+                    toNanoJsonResponse(
+                        commandHandler.errorJsonResult(404, "Endpoint not found: ${method.name} $uri")
                     )
                 }
             }
-        } catch (e: Exception) {
-            emitLog(
+        } catch (e: StorageAccessDeniedException) {
+            toNanoJsonResponse(
+                commandHandler.errorJsonResult(403, e.message ?: "403 Forbidden")
+            )
+        } catch (e: StorageFileNotFoundException) {
+            toNanoJsonResponse(
+                commandHandler.errorJsonResult(404, e.message ?: "404 Not Found")
+            )
+        } catch (_: Exception) {
+            commandHandler.emitSanitizedLog(
                 method = method.name,
                 endpoint = uri,
-                message = "خطأ داخلي في الخادم: ${e.localizedMessage ?: e.javaClass.simpleName}",
+                message = "خطأ داخلي في الخادم (500)",
                 clientIp = clientIp,
                 statusCode = 500,
                 isError = true
             )
-            jsonResponse(
-                status = Response.Status.INTERNAL_ERROR,
-                body = JSONObject()
-                    .put("success", false)
-                    .put("error", e.localizedMessage ?: "Internal server error")
+            toNanoJsonResponse(
+                commandHandler.errorJsonResult(500, "500 Internal Server Error")
             )
         }
     }
 
-    /**
-     * 1. GET /status
-     * Returns live battery level, free storage bytes, and total storage bytes.
-     */
-    private fun handleStatusRequest(clientIp: String): Response {
-        val (batteryLevel, freeBytes, totalBytes) = statusProvider()
-        val rootPath = rootDirProvider().absolutePath
-        emitLog(
-            method = "GET",
-            endpoint = "/status",
-            message = "استعلام حالة الخادم من $clientIp (البطارية $batteryLevel%)",
-            clientIp = clientIp,
-            statusCode = 200
-        )
-        val payload = JSONObject()
-            .put("success", true)
-            .put("status", "online")
-            .put("batteryLevel", batteryLevel)
-            .put("freeStorageBytes", freeBytes)
-            .put("totalStorageBytes", totalBytes)
-            .put("rootPath", rootPath)
-            .put("timestamp", System.currentTimeMillis())
-        return jsonResponse(Response.Status.OK, payload)
-    }
-
-    /**
-     * 2. GET /screenshot
-     * Captures a live Bitmap of the Home Node screen (via PixelCopy / View hierarchy / Telemetry Canvas),
-     * compresses it as JPEG, and returns it with Content-Type: image/jpeg for live HTTP Polling mode.
-     */
-    private fun handleScreenshotRequest(session: IHTTPSession, clientIp: String): Response {
+    private fun handleScreenshotRequest(session: IHTTPSession): Response {
         val quality = getQueryParam(session, "quality")?.toIntOrNull()?.coerceIn(30, 95) ?: 78
-        val bitmap = screenshotBitmapProvider()
-            ?: return jsonResponse(
-                status = Response.Status.SERVICE_UNAVAILABLE,
-                body = JSONObject()
-                    .put("success", false)
-                    .put("error", "Unable to capture screen Bitmap on Home Node")
+        val jpegBytes = commandHandler.captureScreenshotJpegBytes(quality)
+            ?: return toNanoJsonResponse(
+                commandHandler.errorJsonResult(503, "Unable to capture screen Bitmap on Home Node")
             )
-
-        val baos = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, quality, baos)
-        val jpegBytes = baos.toByteArray()
 
         return newFixedLengthResponse(
             Response.Status.OK,
@@ -164,255 +129,81 @@ class LocalFileServer(
             addHeader("Content-Length", jpegBytes.size.toString())
             addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
             addHeader("Pragma", "no-cache")
-            addHeader("Access-Control-Allow-Origin", "*")
             addHeader("X-Timestamp", System.currentTimeMillis().toString())
         }
     }
 
-    /**
-     * 3. GET /files?path={dirPath}
-     * Lists directory contents sorted (folders first, then files alphabetically).
-     */
-    private fun handleFilesListRequest(session: IHTTPSession, clientIp: String): Response {
-        val defaultRoot = rootDirProvider()
-        val requestedPath = getQueryParam(session, "path")?.takeIf { it.isNotBlank() }
-            ?: defaultRoot.absolutePath
-
-        val targetDir = File(requestedPath)
-        val effectiveDir = if (targetDir.exists() && targetDir.isDirectory && targetDir.canRead()) {
-            targetDir
-        } else {
-            defaultRoot
-        }
-
-        val rawFiles = effectiveDir.listFiles()?.toList() ?: emptyList()
-        val sortedFiles = rawFiles.sortedWith(
-            compareBy<File> { !it.isDirectory }
-                .thenBy { it.name.lowercase() }
-        )
-
-        val filesArray = JSONArray()
-        for (file in sortedFiles) {
-            val fileObj = JSONObject()
-                .put("name", file.name)
-                .put("path", file.absolutePath)
-                .put("isDirectory", file.isDirectory)
-                .put("sizeBytes", if (file.isDirectory) 0L else file.length())
-                .put("lastModified", file.lastModified())
-            filesArray.put(fileObj)
-        }
-
-        emitLog(
-            method = "GET",
-            endpoint = "/files",
-            message = "تصفح المجلد: ${effectiveDir.absolutePath} (${sortedFiles.size} عنصر)",
-            clientIp = clientIp,
-            statusCode = 200
-        )
-
-        val parentPath = effectiveDir.parentFile?.takeIf { it.canRead() }?.absolutePath ?: ""
-        val responseBody = JSONObject()
-            .put("success", true)
-            .put("currentPath", effectiveDir.absolutePath)
-            .put("parentPath", parentPath)
-            .put("rootPath", defaultRoot.absolutePath)
-            .put("files", filesArray)
-
-        return jsonResponse(Response.Status.OK, responseBody)
-    }
-
-    /**
-     * 4. GET /download?path={filePath}
-     * Streams the file using newChunkedResponse with Content-Length and Content-Disposition.
-     */
     private fun handleDownloadRequest(session: IHTTPSession, clientIp: String): Response {
-        val filePath = getQueryParam(session, "path")
-            ?: return badRequest("Missing 'path' query parameter")
+        val rawPath = getQueryParam(session, "path")
+            ?: return toNanoJsonResponse(
+                commandHandler.errorJsonResult(400, "Missing 'path' query parameter")
+            )
 
-        val targetFile = File(filePath)
-        if (!targetFile.exists() || !targetFile.isFile || !targetFile.canRead()) {
-            emitLog(
-                method = "GET",
+        return try {
+            val (stat, inputStream) = commandHandler.openVerifiedReadStream(
+                rawPath = rawPath,
+                transportLabel = "HTTP",
                 endpoint = "/download",
-                message = "ملف غير موجود للتحميل: $filePath",
-                clientIp = clientIp,
-                statusCode = 404,
-                isError = true
+                clientId = clientIp
             )
-            return jsonResponse(
-                Response.Status.NOT_FOUND,
-                JSONObject().put("success", false).put("error", "File not found or unreadable: $filePath")
-            )
-        }
-
-        val mimeType = RemoteFileItem.resolveMimeType(targetFile.name)
-        val fileLength = targetFile.length()
-        val encodedFileName = URLEncoder.encode(targetFile.name, "UTF-8").replace("+", "%20")
-
-        emitLog(
-            method = "GET",
-            endpoint = "/download",
-            message = "بدء سحب الملف: ${targetFile.name} (${RemoteFileItem.formatBytes(fileLength)})",
-            clientIp = clientIp,
-            statusCode = 200
-        )
-
-        val fis = FileInputStream(targetFile)
-        return newChunkedResponse(Response.Status.OK, mimeType, fis).apply {
-            addHeader("Content-Length", fileLength.toString())
-            addHeader(
-                "Content-Disposition",
-                "attachment; filename=\"${targetFile.name}\"; filename*=UTF-8''$encodedFileName"
-            )
-            addHeader("Accept-Ranges", "bytes")
+            val encodedFileName = URLEncoder.encode(stat.name, "UTF-8").replace("+", "%20")
+            newChunkedResponse(Response.Status.OK, stat.mimeType, inputStream).apply {
+                addHeader("Content-Length", stat.sizeBytes.toString())
+                addHeader(
+                    "Content-Disposition",
+                    "attachment; filename=\"${stat.name}\"; filename*=UTF-8''$encodedFileName"
+                )
+                addHeader("Accept-Ranges", "bytes")
+            }
+        } catch (e: StorageAccessDeniedException) {
+            toNanoJsonResponse(commandHandler.errorJsonResult(403, e.message ?: "403 Forbidden"))
+        } catch (e: StorageFileNotFoundException) {
+            toNanoJsonResponse(commandHandler.errorJsonResult(404, e.message ?: "404 Not Found"))
         }
     }
 
-    /**
-     * 5. POST /upload?path={targetDir}&filename={fileName}
-     * Streams incoming InputStream directly to disk in 64KB chunks without loading into RAM.
-     */
     private fun handleUploadRequest(session: IHTTPSession, clientIp: String): Response {
-        val targetDirPath = getQueryParam(session, "path")?.takeIf { it.isNotBlank() }
-            ?: rootDirProvider().absolutePath
-        val rawFileName = getQueryParam(session, "filename")?.takeIf { it.isNotBlank() }
-            ?: "uploaded_${System.currentTimeMillis()}.bin"
+        val rawDirPath = getQueryParam(session, "path")
+        val rawFileName = getQueryParam(session, "filename")
+            ?: return toNanoJsonResponse(
+                commandHandler.errorJsonResult(400, "Missing 'filename' query parameter")
+            )
 
-        val safeFileName = File(rawFileName).name
-        val targetDir = File(targetDirPath)
-        if (!targetDir.exists()) {
-            targetDir.mkdirs()
-        }
-        if (!targetDir.isDirectory || !targetDir.canWrite()) {
-            return badRequest("Target directory is not writable: $targetDirPath")
-        }
-
-        val destFile = File(targetDir, safeFileName)
-        val contentLengthHeader = session.headers["content-length"]
-            ?: session.headers["Content-Length"]
+        val contentLengthHeader = session.headers["content-length"] ?: session.headers["Content-Length"]
         val expectedBytes = contentLengthHeader?.toLongOrNull() ?: -1L
 
-        emitLog(
-            method = "POST",
-            endpoint = "/upload",
-            message = "جاري استقبال ملف: $safeFileName إلى ${targetDir.name}",
-            clientIp = clientIp,
-            statusCode = 200
+        val res = commandHandler.handleUploadStream(
+            rawDirPath = rawDirPath,
+            rawFileName = rawFileName,
+            inputStream = session.inputStream,
+            expectedBytes = expectedBytes,
+            transportLabel = "HTTP",
+            clientId = clientIp
         )
-
-        var totalWritten = 0L
-        val buffer = ByteArray(64 * 1024)
-        val inputStream = session.inputStream
-
-        FileOutputStream(destFile).use { fos ->
-            if (expectedBytes >= 0L) {
-                var remaining = expectedBytes
-                while (remaining > 0L) {
-                    val toRead = minOf(buffer.size.toLong(), remaining).toInt()
-                    val readCount = inputStream.read(buffer, 0, toRead)
-                    if (readCount <= 0) break
-                    fos.write(buffer, 0, readCount)
-                    totalWritten += readCount
-                    remaining -= readCount
-                }
-            } else {
-                while (true) {
-                    val readCount = inputStream.read(buffer)
-                    if (readCount <= 0) break
-                    fos.write(buffer, 0, readCount)
-                    totalWritten += readCount
-                }
-            }
-            fos.flush()
-        }
-
-        emitLog(
-            method = "POST",
-            endpoint = "/upload",
-            message = "اكتمل رفع الملف: $safeFileName (${RemoteFileItem.formatBytes(totalWritten)})",
-            clientIp = clientIp,
-            statusCode = 200
-        )
-
-        val payload = JSONObject()
-            .put("success", true)
-            .put("name", destFile.name)
-            .put("path", destFile.absolutePath)
-            .put("sizeBytes", totalWritten)
-
-        return jsonResponse(Response.Status.OK, payload)
+        return toNanoJsonResponse(res)
     }
 
-    /**
-     * 6. DELETE /delete?path={targetPath}
-     * Deletes the requested file or folder and returns the operation result.
-     */
-    private fun handleDeleteRequest(session: IHTTPSession, clientIp: String): Response {
-        val targetPath = getQueryParam(session, "path")
-            ?: return badRequest("Missing 'path' query parameter")
-
-        val targetFile = File(targetPath)
-        if (!targetFile.exists()) {
-            return jsonResponse(
-                Response.Status.NOT_FOUND,
-                JSONObject().put("success", false).put("error", "Target file does not exist: $targetPath")
-            )
-        }
-
-        val fileName = targetFile.name
-        val deleted = if (targetFile.isDirectory) {
-            targetFile.deleteRecursively()
-        } else {
-            targetFile.delete()
-        }
-
-        emitLog(
-            method = "DELETE",
-            endpoint = "/delete",
-            message = if (deleted) "تم حذف: $fileName بنجاح" else "فشل حذف: $fileName",
-            clientIp = clientIp,
-            statusCode = if (deleted) 200 else 500,
-            isError = !deleted
-        )
-
-        val payload = JSONObject()
-            .put("success", deleted)
-            .put("path", targetPath)
-            .put("message", if (deleted) "Deleted successfully" else "Failed to delete file")
-
-        return jsonResponse(
-            if (deleted) Response.Status.OK else Response.Status.INTERNAL_ERROR,
-            payload
-        )
-    }
-
-    /**
-     * 7. GET /stream?path={filePath}
-     * RFC 7233 HTTP Byte-Range video & audio streaming endpoint with 206 Partial Content
-     * and FileInputStream.skip(startFrom) for instant seeking without full download.
-     */
     private fun handleStreamRequest(session: IHTTPSession, clientIp: String): Response {
-        val filePath = getQueryParam(session, "path")
-            ?: return badRequest("Missing 'path' query parameter")
+        val rawPath = getQueryParam(session, "path")
+            ?: return toNanoJsonResponse(
+                commandHandler.errorJsonResult(400, "Missing 'path' query parameter")
+            )
 
-        val mediaFile = File(filePath)
-        if (!mediaFile.exists() || !mediaFile.isFile || !mediaFile.canRead()) {
-            emitLog(
-                method = "GET",
+        val (stat, stream) = try {
+            commandHandler.openVerifiedReadStream(
+                rawPath = rawPath,
+                transportLabel = "HTTP",
                 endpoint = "/stream",
-                message = "ملف الوسائط غير موجود للبث: $filePath",
-                clientIp = clientIp,
-                statusCode = 404,
-                isError = true
+                clientId = clientIp
             )
-            return jsonResponse(
-                Response.Status.NOT_FOUND,
-                JSONObject().put("success", false).put("error", "Media file not found: $filePath")
-            )
+        } catch (e: StorageAccessDeniedException) {
+            return toNanoJsonResponse(commandHandler.errorJsonResult(403, e.message ?: "403 Forbidden"))
+        } catch (e: StorageFileNotFoundException) {
+            return toNanoJsonResponse(commandHandler.errorJsonResult(404, e.message ?: "404 Not Found"))
         }
 
-        val fileLength = mediaFile.length()
-        val mimeType = RemoteFileItem.resolveMimeType(mediaFile.name)
+        val fileLength = stat.sizeBytes
+        val mimeType = stat.mimeType
         val rangeHeader = session.headers["range"] ?: session.headers["Range"]
 
         if (!rangeHeader.isNullOrBlank() && rangeHeader.startsWith("bytes=")) {
@@ -423,6 +214,10 @@ class LocalFileServer(
             val endAt = (requestedEnd ?: (fileLength - 1L)).coerceAtMost(fileLength - 1L)
 
             if (startFrom >= fileLength || startFrom > endAt) {
+                try {
+                    stream.close()
+                } catch (_: Throwable) {
+                }
                 return newFixedLengthResponse(
                     Response.Status.RANGE_NOT_SATISFIABLE,
                     MIME_PLAINTEXT,
@@ -434,21 +229,12 @@ class LocalFileServer(
             }
 
             val contentLength = (endAt - startFrom) + 1L
-            val fis = FileInputStream(mediaFile)
-            skipFully(fis, startFrom)
-
-            emitLog(
-                method = "GET",
-                endpoint = "/stream",
-                message = "بث جزئي (206): ${mediaFile.name} [$startFrom-$endAt/$fileLength]",
-                clientIp = clientIp,
-                statusCode = 206
-            )
+            skipFully(stream, startFrom)
 
             return newFixedLengthResponse(
                 Response.Status.PARTIAL_CONTENT,
                 mimeType,
-                fis,
+                stream,
                 contentLength
             ).apply {
                 addHeader("Accept-Ranges", "bytes")
@@ -457,18 +243,10 @@ class LocalFileServer(
                 addHeader("Connection", "keep-alive")
             }
         } else {
-            val fis = FileInputStream(mediaFile)
-            emitLog(
-                method = "GET",
-                endpoint = "/stream",
-                message = "بدء البث المباشر (200): ${mediaFile.name} (${RemoteFileItem.formatBytes(fileLength)})",
-                clientIp = clientIp,
-                statusCode = 200
-            )
             return newFixedLengthResponse(
                 Response.Status.OK,
                 mimeType,
-                fis,
+                stream,
                 fileLength
             ).apply {
                 addHeader("Accept-Ranges", "bytes")
@@ -509,38 +287,23 @@ class LocalFileServer(
         return null
     }
 
-    private fun badRequest(message: String): Response {
-        return jsonResponse(
-            Response.Status.BAD_REQUEST,
-            JSONObject().put("success", false).put("error", message)
-        )
+    private fun toNanoJsonResponse(result: CommandJsonResult): Response {
+        val status = when (result.statusCode) {
+            200 -> Response.Status.OK
+            400 -> Response.Status.BAD_REQUEST
+            401 -> Response.Status.UNAUTHORIZED
+            403 -> Response.Status.FORBIDDEN
+            404 -> Response.Status.NOT_FOUND
+            503 -> Response.Status.SERVICE_UNAVAILABLE
+            else -> Response.Status.INTERNAL_ERROR
+        }
+        return jsonResponse(status, result.body)
     }
 
     private fun jsonResponse(status: Response.Status, body: JSONObject): Response {
         return newFixedLengthResponse(status, MIME_JSON, body.toString()).apply {
-            addHeader("Access-Control-Allow-Origin", "*")
             addHeader("Cache-Control", "no-store")
         }
-    }
-
-    private fun emitLog(
-        method: String,
-        endpoint: String,
-        message: String,
-        clientIp: String,
-        statusCode: Int,
-        isError: Boolean = false
-    ) {
-        onLog(
-            ServerLog(
-                method = method,
-                endpoint = endpoint,
-                message = message,
-                clientIp = clientIp,
-                statusCode = statusCode,
-                isError = isError
-            )
-        )
     }
 
     companion object {

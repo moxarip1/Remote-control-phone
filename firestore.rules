@@ -22,12 +22,30 @@ service cloud.firestore {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
+    // Phase 1.6: secretToken is strictly prohibited in Firestore documents (!('secretToken' in data))
     function isValidHomeNode(data) {
-      return data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 128 &&
+      return data.keys().hasOnly([
+               'userId',
+               'deviceName',
+               'signalingPath',
+               'ipAddress',
+               'port',
+               'isOnline',
+               'p2pState',
+               'batteryLevel',
+               'freeStorageBytes',
+               'totalStorageBytes',
+               'lastUpdated',
+               'createdAt',
+               'updatedAt'
+             ]) &&
+             !('secretToken' in data) &&
+             data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 128 &&
              data.userId == request.auth.uid &&
              data.deviceName is string && data.deviceName.size() >= 1 && data.deviceName.size() <= 120 &&
+             (!('ipAddress' in data) || (data.ipAddress is string && data.ipAddress.size() <= 64)) &&
+             (!('port' in data) || (data.port is int && data.port >= 1024 && data.port <= 65535)) &&
              data.isOnline is bool &&
-             data.secretToken is string && data.secretToken.size() <= 128 &&
              data.batteryLevel is int && data.batteryLevel >= 0 && data.batteryLevel <= 100 &&
              data.freeStorageBytes is int && data.freeStorageBytes >= 0 &&
              data.totalStorageBytes is int && data.totalStorageBytes >= 0 &&
@@ -72,7 +90,8 @@ service cloud.firestore {
                                isValidId(userId) &&
                                isValidId(sessionId) &&
                                request.auth.uid == userId &&
-                               incoming().userId == request.auth.uid;
+                               incoming().userId == request.auth.uid &&
+                               !('secretToken' in incoming());
 
       allow delete: if isSignedIn() &&
                        isValidId(userId) &&
@@ -89,7 +108,8 @@ service cloud.firestore {
                                isValidId(userId) &&
                                isValidId(sessionId) &&
                                request.auth.uid == userId &&
-                               incoming().userId == request.auth.uid;
+                               incoming().userId == request.auth.uid &&
+                               !('secretToken' in incoming());
 
       allow delete: if isSignedIn() &&
                        isValidId(userId) &&

@@ -2,6 +2,7 @@ package com.example.model
 
 import com.google.firebase.Timestamp
 import com.google.firebase.firestore.DocumentId
+import com.google.firebase.firestore.Exclude
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.IgnoreExtraProperties
 import com.google.firebase.firestore.PropertyName
@@ -23,9 +24,11 @@ enum class AppMode {
 
 /**
  * Represents the global WebRTC P2P state & telemetry of the Home Node Server.
- * Instead of relying on a local Wi-Fi IP address, the Home Node and Admin Controller
- * establish a direct encrypted WebRTC PeerConnection & RTCDataChannel via Firebase
- * signaling at `users/{uid}/signaling`.
+ *
+ * Security hardening (Phase 1.6):
+ * `secretToken` is NEVER written to Firestore (`toFirestoreCreateMap` / `toFirestoreUpdateMap`)
+ * or Realtime Database (`toRealtimeDbMap`). It is excluded via `@get:Exclude` and stored only
+ * locally in Android Keystore AES-256-GCM encrypted storage.
  */
 @IgnoreExtraProperties
 data class HomeNodeInfo(
@@ -39,6 +42,7 @@ data class HomeNodeInfo(
     @get:PropertyName("isOnline")
     @field:PropertyName("isOnline")
     val isOnline: Boolean = false,
+    @get:Exclude
     val secretToken: String = "",
     val batteryLevel: Int = 100,
     val freeStorageBytes: Long = 0L,
@@ -68,7 +72,6 @@ data class HomeNodeInfo(
             "ipAddress" to ipAddress.take(64).ifBlank { "WebRTC-P2P-Global" },
             "port" to port.coerceIn(1024, 65535),
             "isOnline" to isOnline,
-            "secretToken" to secretToken.take(128),
             "batteryLevel" to batteryLevel.coerceIn(0, 100),
             "freeStorageBytes" to freeStorageBytes.coerceAtLeast(0L),
             "totalStorageBytes" to totalStorageBytes.coerceAtLeast(0L),
@@ -86,7 +89,6 @@ data class HomeNodeInfo(
             "ipAddress" to ipAddress.take(64).ifBlank { "WebRTC-P2P-Global" },
             "port" to port.coerceIn(1024, 65535),
             "isOnline" to isOnline,
-            "secretToken" to secretToken.take(128),
             "batteryLevel" to batteryLevel.coerceIn(0, 100),
             "freeStorageBytes" to freeStorageBytes.coerceAtLeast(0L),
             "totalStorageBytes" to totalStorageBytes.coerceAtLeast(0L),
@@ -103,7 +105,6 @@ data class HomeNodeInfo(
             "ipAddress" to ipAddress.take(64).ifBlank { "WebRTC-P2P-Global" },
             "port" to port.coerceIn(1024, 65535),
             "isOnline" to isOnline,
-            "secretToken" to secretToken.take(128),
             "batteryLevel" to batteryLevel.coerceIn(0, 100),
             "freeStorageBytes" to freeStorageBytes.coerceAtLeast(0L),
             "totalStorageBytes" to totalStorageBytes.coerceAtLeast(0L),
@@ -134,7 +135,8 @@ data class RemoteFileItem(
     val path: String = "",
     val isDirectory: Boolean = false,
     val sizeBytes: Long = 0L,
-    val lastModified: Long = 0L
+    val lastModified: Long = 0L,
+    val mimeType: String = resolveMimeType(name)
 ) {
     val extension: String
         get() = name.substringAfterLast('.', "").lowercase(Locale.ROOT)
@@ -159,7 +161,7 @@ data class RemoteFileItem(
         return sdf.format(Date(lastModified))
     }
 
-    fun mimeType(): String = resolveMimeType(name)
+    fun mimeType(): String = mimeType.ifBlank { resolveMimeType(name) }
 
     companion object {
         val VIDEO_EXTENSIONS = setOf("mp4", "m4v", "mkv", "webm", "mov", "3gp", "avi")

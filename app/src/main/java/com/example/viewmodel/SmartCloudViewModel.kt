@@ -22,8 +22,11 @@ import com.example.model.TransferProgress
 import com.example.receiver.BootCompletedReceiver
 import com.example.repository.AuthTokenManager
 import com.example.repository.SmartCloudRepository
+import com.example.security.ConstantTimeAuth
 import com.example.server.LocalFileServer
 import com.example.service.HomeServerForegroundService
+import com.example.storage.SharedRootEntry
+import com.example.storage.SharedRootsRepository
 import com.example.webrtc.WebRtcP2pClientManager
 import com.google.firebase.auth.FirebaseUser
 import com.google.firebase.firestore.FirebaseFirestore
@@ -64,6 +67,10 @@ class SmartCloudViewModel(
     val isMediaProjectionEnabled: StateFlow<Boolean> = HomeServerForegroundService.isMediaProjectionEnabled
     val webRtcStateText: StateFlow<String> = HomeServerForegroundService.webRtcStateText
 
+    // SAF Shared Roots & LAN Debug Mode Flows (Phase 1.1 & 1.5)
+    val sharedRoots: StateFlow<List<SharedRootEntry>> = SharedRootsRepository.sharedRootsFlow
+    val isLanDebugHttpEnabled: StateFlow<Boolean> = AuthTokenManager.isLanDebugHttpEnabledFlow
+
     // Global WebRTC P2P Admin Client Flows
     val isP2pConnected: StateFlow<Boolean> =
         p2pClientManager?.isP2pConnected ?: MutableStateFlow(false).asStateFlow()
@@ -98,7 +105,7 @@ class SmartCloudViewModel(
     private val _pendingDeleteItem = MutableStateFlow<RemoteFileItem?>(null)
     val pendingDeleteItem: StateFlow<RemoteFileItem?> = _pendingDeleteItem.asStateFlow()
 
-    // Persistent Auth Token (x-auth-token) saved in localStorage (SharedPreferences)
+    // Keystore-backed Auth Token (x-auth-token)
     val savedAuthToken: StateFlow<String> = AuthTokenManager.authTokenFlow
 
     private val _isAuthTokenDialogOpen = MutableStateFlow(false)
@@ -111,9 +118,20 @@ class SmartCloudViewModel(
 
     init {
         if (appContext != null) {
+            SharedRootsRepository.validateAndLoadRoots(appContext)
             val initialToken = AuthTokenManager.init(appContext)
             if (initialToken.isNotBlank()) {
                 p2pClientManager?.updateAuthToken(initialToken)
+            }
+        }
+
+        // Observe Keystore fail-closed state and immediately surface clear error requiring re-pairing
+        viewModelScope.launch {
+            AuthTokenManager.keystoreErrorFlow.collect { keystoreErr ->
+                if (!keystoreErr.isNullOrBlank()) {
+                    p2pClientManager?.updateAuthToken("")
+                    _errorBannerMessage.value = keystoreErr
+                }
             }
         }
 
@@ -166,6 +184,58 @@ class SmartCloudViewModel(
         }
     }
 
+    // =========================================================================
+    // SAF SHARED ROOTS & LAN DEBUG MODE (Phase 1.1 & 1.5)
+    // =========================================================================
+
+    fun refreshSharedRoots(context: Context) {
+        SharedRootsRepository.validateAndLoadRoots(context)
+    }
+
+    fun addSharedRootUri(context: Context, treeUri: Uri, allowUploads: Boolean = false) {
+        val entry = SharedRootsRepository.addSharedRootUri(context, treeUri, allowUploads)
+        if (entry != null) {
+            _errorBannerMessage.value = null
+            _statusBannerMessage.value =
+                "تمت إضافة المجلد المشترك عبر SAF بنجاح (قراءة فقط افتراضياً): ${entry.displayName} (${entry.rootId})"
+        } else {
+            _errorBannerMessage.value =
+                "تعذر إضافة المجلد المشترك (SAF): تأكد من منح صلاحية الوصول للمجلد"
+        }
+    }
+
+    fun removeSharedRoot(context: Context, rootId: String) {
+        SharedRootsRepository.removeSharedRoot(context, rootId)
+        _statusBannerMessage.value = "تم إلغاء مشاركة المجلد ($rootId) وإزالة صلاحية الوصول"
+    }
+
+    fun setRootAllowUploads(context: Context, rootId: String, allowUploads: Boolean) {
+        SharedRootsRepository.setAllowUploads(context, rootId, allowUploads)
+    }
+
+    fun setLanDebugHttpEnabled(context: Context, enabled: Boolean) {
+        AuthTokenManager.setLanDebugHttpEnabled(context, enabled)
+        val appCtx = context.applicationContext
+        try {
+            val intent = Intent(appCtx, HomeServerForegroundService::class.java).apply {
+                action = HomeServerForegroundService.ACTION_SET_LAN_DEBUG_MODE
+                putExtra(HomeServerForegroundService.EXTRA_LAN_DEBUG_ENABLED, enabled)
+            }
+            appCtx.startService(intent)
+        } catch (_: Throwable) {
+        }
+        _statusBannerMessage.value = if (enabled) {
+            "تحذير أمني: تم تفعيل وضع تصحيح الشبكة المحلية (LAN HTTP Cleartext Debug Mode) برمز جلسة عشوائي مؤقت"
+        } else {
+            "تم إيقاف خادم LAN HTTP المحلي؛ جميع الاتصالات تتم حصرياً عبر WebRTC DataChannel المشفر (DTLS)"
+        }
+    }
+
+    fun generateAndSaveNew32ByteToken() {
+        val newToken = ConstantTimeAuth.generateRandom32ByteTokenHex()
+        updateAuthToken(newToken, closeDialog = false)
+    }
+
     fun openAuthTokenDialog() {
         _isAuthTokenDialogOpen.value = true
     }
@@ -175,7 +245,7 @@ class SmartCloudViewModel(
     }
 
     /**
-     * Saves the Auth Token (`x-auth-token`) automatically in localStorage (`SharedPreferences`),
+     * Saves the Auth Token (`x-auth-token`) in Android Keystore-encrypted storage (`KeystoreSecretStore`),
      * updates the active WebRTC/HTTP headers, and syncs with the Home Node Server if running.
      */
     fun updateAuthToken(newToken: String, closeDialog: Boolean = false) {
@@ -206,7 +276,7 @@ class SmartCloudViewModel(
         }
 
         _errorBannerMessage.value = null
-        _statusBannerMessage.value = "تم حفظ رمز المصادقة (x-auth-token) في localStorage وتفعيله لجميع الطلبات"
+        _statusBannerMessage.value = "تم تشفير وحفظ رمز المصادقة (x-auth-token) في Android Keystore وتفعيله لجميع الطلبات"
 
         val node = _discoveredHomeNode.value
         if (node != null && node.isOnline &&
@@ -225,29 +295,30 @@ class SmartCloudViewModel(
     }
 
     /**
-     * Automatically syncs the `x-auth-token` from the discovered Home Node in Firebase
-     * into localStorage (`SharedPreferences`).
+     * Copies the local server token if running on the same device, or reminds the user that
+     * `secretToken` is no longer published in Firestore (Phase 1.6 security hardening).
      */
     fun syncAuthTokenFromCloudNode() {
-        val cloudToken = _discoveredHomeNode.value?.secretToken?.trim()
-            ?.ifBlank { localServerNodeInfo.value?.secretToken?.trim().orEmpty() }
+        val localServerToken = localServerNodeInfo.value?.secretToken?.trim()
+            ?.ifBlank { appContext?.let { AuthTokenManager.ensureServerPersistentToken(it) }.orEmpty() }
             .orEmpty()
-        if (cloudToken.isBlank()) {
-            _errorBannerMessage.value = "لا يوجد رمز مصادقة منشور من هاتف المنزل حالياً، يرجى إدخاله يدوياً"
+        if (localServerToken.isBlank()) {
+            _errorBannerMessage.value =
+                "حماية Phase 1.6: لم يعد يتم نشر secretToken في Firestore. يرجى نسخ رمز المصادقة (32-byte) من شاشة الخادم المنزلي."
             return
         }
-        AuthTokenManager.saveAuthToken(appContext, cloudToken, isManualOverride = false)
-        p2pClientManager?.updateAuthToken(cloudToken)
+        AuthTokenManager.saveAuthToken(appContext, localServerToken, isManualOverride = false)
+        p2pClientManager?.updateAuthToken(localServerToken)
         _isAuthTokenDialogOpen.value = false
         _errorBannerMessage.value = null
-        _statusBannerMessage.value = "تمت مزامنة وحفظ رمز المصادقة (x-auth-token) تلقائياً من هاتف المنزل"
+        _statusBannerMessage.value = "تم استرداد رمز المصادقة المشفر من Keystore المحلي وتفعيله"
         if (_selectedMode.value == AppMode.ADMIN_CONTROLLER) {
             loadRemoteDirectory(_currentRemotePath.value)
         }
     }
 
     /**
-     * Enforces Requirement 4: Blocks any outgoing request if the Auth Token (`x-auth-token`) is empty,
+     * Blocks any outgoing request if the Auth Token (`x-auth-token`) is empty,
      * showing a prominent alert asking the user to enter the token first.
      */
     private fun requireValidAuthTokenOrAlert(): String? {
@@ -427,8 +498,11 @@ class SmartCloudViewModel(
                 // Persist role as Home Server and ensure Admin P2P client does not collide locally
                 saveDeviceRole(BootCompletedReceiver.ROLE_HOME_SERVER)
                 p2pClientManager?.disconnectAll()
-                if (appContext != null && !isServerRunning.value) {
-                    startHomeServerService(appContext, silent = true)
+                if (appContext != null) {
+                    SharedRootsRepository.validateAndLoadRoots(appContext)
+                    if (!isServerRunning.value) {
+                        startHomeServerService(appContext, silent = true)
+                    }
                 }
             }
             AppMode.ADMIN_CONTROLLER, AppMode.SCREEN_MIRRORING -> {
@@ -440,23 +514,20 @@ class SmartCloudViewModel(
                     !node.deviceName.equals(localDeviceName, ignoreCase = true)
 
                 if (isAnotherRemoteDeviceOnline) {
-                    // When controlling a different remote Home Phone, mark this phone as Admin
-                    // and stop any local server so it never overwrites the remote Home Phone's signaling.
                     saveDeviceRole(BootCompletedReceiver.ROLE_ADMIN_ONLY)
                     if (isServerRunning.value && appContext != null) {
                         stopHomeServerService(appContext)
                     }
                 } else if (appContext != null && !isServerRunning.value) {
-                    // Single-device testing: ensure local server is running automatically
                     startHomeServerService(appContext, silent = true)
                 }
 
                 if (node != null && node.isOnline) {
-                    val syncedToken = AuthTokenManager.syncWithDiscoveredNodeToken(appContext, node.secretToken)
-                    if (syncedToken.isNotBlank()) {
+                    val savedToken = AuthTokenManager.getSavedAuthToken(appContext)
+                    if (savedToken.isNotBlank()) {
                         p2pClientManager?.connectToHomeNodeP2p(
                             userId = uid.ifBlank { node.userId },
-                            secretToken = syncedToken
+                            secretToken = savedToken
                         )
                     }
                     if (mode == AppMode.ADMIN_CONTROLLER) {
@@ -466,6 +537,7 @@ class SmartCloudViewModel(
             }
             AppMode.NONE -> {
                 if (appContext != null) {
+                    SharedRootsRepository.validateAndLoadRoots(appContext)
                     ensureHomeServerAlwaysRunning(appContext)
                 }
             }
@@ -518,8 +590,6 @@ class SmartCloudViewModel(
             return
         }
 
-        // On ModeSelector (AppMode.NONE): auto-start unless another remote Home Phone is actively online
-        // and this phone was used as an Admin Controller.
         val savedRole = readSavedDeviceRole(context)
         if (!isAnotherRemoteDeviceOnline || savedRole == BootCompletedReceiver.ROLE_HOME_SERVER) {
             startHomeServerService(context, silent = true)
@@ -565,9 +635,6 @@ class SmartCloudViewModel(
         }
 
         try {
-            // Always prefer startService() when launched from foreground UI so the OS never arms
-            // a fatal ForegroundServiceDidNotStartInTimeException timer if notifications are denied/restricted.
-            // HomeServerForegroundService still promotes itself via startForeground() inside onStartCommand.
             appCtx.startService(intent)
         } catch (_: Throwable) {
             try {
@@ -638,11 +705,7 @@ class SmartCloudViewModel(
                 }
                 .collect { nodeInfo ->
                     _discoveredHomeNode.value = nodeInfo
-                    val effectiveToken = if (nodeInfo != null && nodeInfo.secretToken.isNotBlank()) {
-                        AuthTokenManager.syncWithDiscoveredNodeToken(appContext, nodeInfo.secretToken)
-                    } else {
-                        AuthTokenManager.getSavedAuthToken(appContext)
-                    }
+                    val effectiveToken = AuthTokenManager.getSavedAuthToken(appContext)
                     if (effectiveToken.isNotBlank()) {
                         p2pClientManager?.updateAuthToken(effectiveToken)
                     }
@@ -720,7 +783,7 @@ class SmartCloudViewModel(
                 }
                 _remoteFiles.value = listing.items
             }.onFailure { error ->
-                _errorBannerMessage.value = "جاري إتمام ربط نفق WebRTC P2P السحابي (${node.effectiveSignalingPath()}): ${error.localizedMessage}"
+                _errorBannerMessage.value = "تعذر جلب المجلد (${node.effectiveSignalingPath()}): ${error.localizedMessage}"
             }
         }
     }
@@ -728,8 +791,7 @@ class SmartCloudViewModel(
     fun canNavigateUpInRemoteBrowser(): Boolean {
         val current = _currentRemotePath.value
         val root = _rootRemotePath.value
-        val parent = _parentRemotePath.value
-        return current.isNotBlank() && parent.isNotBlank() && current != root
+        return current.isNotBlank() && current != root
     }
 
     fun navigateUpInRemoteBrowser(): Boolean {
@@ -759,9 +821,9 @@ class SmartCloudViewModel(
     }
 
     fun getStreamUrlForItem(item: RemoteFileItem): String? {
-        val token = requireValidAuthTokenOrAlert() ?: return null
+        requireValidAuthTokenOrAlert() ?: return null
         val node = _discoveredHomeNode.value ?: return null
-        return repository.buildStreamUrl(node, item, token)
+        return repository.buildStreamUrl(node, item)
     }
 
     fun downloadFileFromHomeNode(context: Context, item: RemoteFileItem) {
@@ -777,7 +839,7 @@ class SmartCloudViewModel(
                 onProgress = { progress -> _transferProgress.value = progress }
             )
             result.onSuccess { savedFile ->
-                _statusBannerMessage.value = "تم حفظ الملف عبر P2P في التنزيلات: ${savedFile.name}"
+                _statusBannerMessage.value = "تم حفظ الملف عبر P2P في مجلد تنزيلات التطبيق: ${savedFile.name}"
             }.onFailure { error ->
                 _errorBannerMessage.value = "فشل سحب الملف عبر P2P: ${error.localizedMessage}"
             }
@@ -788,6 +850,10 @@ class SmartCloudViewModel(
         val token = requireValidAuthTokenOrAlert() ?: return
         val node = _discoveredHomeNode.value ?: return
         val targetDir = _currentRemotePath.value
+        if (targetDir.isBlank()) {
+            _errorBannerMessage.value = "يرجى فتح أحد المجلدات المشتركة (Shared Root) أولاً قبل رفع ملف إليه"
+            return
+        }
         viewModelScope.launch {
             _errorBannerMessage.value = null
             val result = repository.uploadFileToHomeNode(

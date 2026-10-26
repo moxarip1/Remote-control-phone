@@ -113,8 +113,10 @@ import com.example.model.HomeNodeInfo
 import com.example.model.RemoteFileItem
 import com.example.model.ServerLog
 import com.example.model.TransferProgress
-import java.io.File
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.filled.Email
@@ -124,6 +126,7 @@ import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.runtime.getValue
@@ -135,6 +138,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import com.example.storage.SharedRootEntry
 
 data class SystemPermissionsState(
     val hasStorageAccess: Boolean,
@@ -736,6 +740,7 @@ private fun FeaturePillCard(
 fun ModeSelectorScreen(
     userEmail: String,
     permissionsState: SystemPermissionsState,
+    sharedRootsCount: Int = 0,
     discoveredHomeNode: HomeNodeInfo?,
     isLocalServerRunning: Boolean,
     onRequestStoragePermission: () -> Unit,
@@ -805,7 +810,7 @@ fun ModeSelectorScreen(
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Text(
-                                text = "الصلاحيات واستمرارية النظام",
+                                text = "الصلاحيات والمجلدات المشتركة (SAF)",
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold
                             )
@@ -818,7 +823,7 @@ fun ModeSelectorScreen(
                                 }
                             ) {
                                 Text(
-                                    text = if (permissionsState.allGranted) "جاهزة للعمل" else "اختيارية / متاحة",
+                                    text = if (permissionsState.allGranted) "جاهزة للعمل" else "يرجى اختيار مجلد مشترك",
                                     style = MaterialTheme.typography.labelMedium,
                                     color = if (permissionsState.allGranted) Color(0xFF10B981) else Color(0xFFF59E0B),
                                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
@@ -827,11 +832,15 @@ fun ModeSelectorScreen(
                         }
 
                         PermissionRowItem(
-                            icon = Icons.Default.SdStorage,
-                            title = "إدارة كل الملفات (MANAGE_EXTERNAL_STORAGE)",
-                            subtitle = "مطلوبة لقراءة وكتابة ملفات الخادم المنزلي بالكامل",
+                            icon = Icons.Default.Folder,
+                            title = "مشاركة المجلدات الآمنة (Storage Access Framework)",
+                            subtitle = if (sharedRootsCount > 0) {
+                                "تم اختيار $sharedRootsCount مجلد مشترك بصلاحية SAF دائمة (يرفض أي وصول خارجها بـ 403)"
+                            } else {
+                                "اختر المجلدات المسموح بمشاركتها فقط عبر ACTION_OPEN_DOCUMENT_TREE (بدون MANAGE_EXTERNAL_STORAGE)"
+                            },
                             isGranted = permissionsState.hasStorageAccess,
-                            buttonText = "تفعيل",
+                            buttonText = "اختيار مجلد",
                             testTag = "grant_storage_permission_button",
                             onClick = onRequestStoragePermission
                         )
@@ -1099,6 +1108,13 @@ fun HomeNodeServerScreen(
     isAuthTokenDialogOpen: Boolean = false,
     isMediaProjectionEnabled: Boolean = false,
     webRtcStateText: String = "",
+    sharedRoots: List<SharedRootEntry> = emptyList(),
+    isLanDebugHttpEnabled: Boolean = false,
+    onAddSharedRoot: () -> Unit = {},
+    onRemoveSharedRoot: (String) -> Unit = {},
+    onToggleRootAllowUploads: (String, Boolean) -> Unit = { _, _ -> },
+    onToggleLanDebugHttp: (Boolean) -> Unit = {},
+    onRotateAuthToken: () -> Unit = {},
     onStartServer: () -> Unit = {},
     onStopServer: () -> Unit = {},
     onUpdateAuthToken: (String, Boolean) -> Unit = { _, _ -> },
@@ -1108,6 +1124,7 @@ fun HomeNodeServerScreen(
     onClearLogs: () -> Unit,
     onBackToModeSelector: () -> Unit
 ) {
+    val context = LocalContext.current
     BackHandler(onBack = onBackToModeSelector)
 
     // Automatically ensure the server is started and kept running whenever this screen is active
@@ -1130,7 +1147,7 @@ fun HomeNodeServerScreen(
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "يعمل تلقائياً ودائماً • متصل ومزامن مع Firebase",
+                                text = "يعمل تلقائياً ودائماً • SAF + Keystore AES-GCM",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = Color(0xFF10B981)
                             )
@@ -1177,148 +1194,378 @@ fun HomeNodeServerScreen(
                 )
             }
         ) { innerPadding ->
-            Column(
+            LazyColumn(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(innerPadding)
                     .padding(horizontal = 16.dp, vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                // Server Status & Telemetry Card (Always-On Automatic Mode)
-                ElevatedCard(
-                    shape = RoundedCornerShape(22.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(18.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                item {
+                    // Server Status & Telemetry Card (Always-On Automatic Mode)
+                    ElevatedCard(
+                        shape = RoundedCornerShape(22.dp),
+                        modifier = Modifier.fillMaxWidth()
                     ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(18.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(14.dp)
-                                        .clip(CircleShape)
-                                        .background(Color(0xFF10B981))
-                                )
-                                Spacer(modifier = Modifier.width(10.dp))
-                                Text(
-                                    text = "ONLINE • يعمل تلقائياً ودائماً",
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.ExtraBold,
-                                    color = Color(0xFF10B981)
-                                )
-                            }
-
-                            Surface(
-                                shape = RoundedCornerShape(50),
-                                color = Color(0xFF10B981).copy(alpha = 0.16f),
-                                modifier = Modifier.testTag("always_on_server_badge")
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.CloudDone,
-                                        contentDescription = null,
-                                        tint = Color(0xFF10B981),
-                                        modifier = Modifier.size(16.dp)
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(14.dp)
+                                            .clip(CircleShape)
+                                            .background(Color(0xFF10B981))
                                     )
-                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Spacer(modifier = Modifier.width(10.dp))
                                     Text(
-                                        text = "نشط دائماً 24/7",
-                                        style = MaterialTheme.typography.labelMedium,
-                                        color = Color(0xFF10B981),
-                                        fontWeight = FontWeight.Bold
+                                        text = "ONLINE • يعمل تلقائياً ودائماً",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.ExtraBold,
+                                        color = Color(0xFF10B981)
                                     )
                                 }
-                            }
-                        }
 
-                        HorizontalDivider()
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            TelemetryStatChip(
-                                icon = Icons.Default.Router,
-                                label = "مسار الإشارات العالمي (P2P)",
-                                value = "متاح عالمياً عبر P2P",
-                                modifier = Modifier.weight(1f)
-                            )
-                            TelemetryStatChip(
-                                icon = Icons.Default.BatteryChargingFull,
-                                label = "البطارية",
-                                value = "${nodeInfo?.batteryLevel ?: 100}%",
-                                modifier = Modifier.weight(0.7f)
-                            )
-                        }
-
-                        if (nodeInfo != null) {
-                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween
+                                Surface(
+                                    shape = RoundedCornerShape(50),
+                                    color = Color(0xFF10B981).copy(alpha = 0.16f),
+                                    modifier = Modifier.testTag("always_on_server_badge")
                                 ) {
-                                    Text(
-                                        text = "المساحة المتاحة: ${RemoteFileItem.formatBytes(nodeInfo.freeStorageBytes)}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                    Text(
-                                        text = "الإجمالي: ${RemoteFileItem.formatBytes(nodeInfo.totalStorageBytes)}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.CloudDone,
+                                            contentDescription = null,
+                                            tint = Color(0xFF10B981),
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = "WebRTC DTLS 24/7",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = Color(0xFF10B981),
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
                                 }
-                                LinearProgressIndicator(
-                                    progress = { nodeInfo.usedStorageFraction() },
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(8.dp)
-                                        .clip(RoundedCornerShape(50))
-                                )
                             }
+
+                            HorizontalDivider()
 
                             Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                modifier = Modifier.fillMaxWidth()
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
+                                TelemetryStatChip(
+                                    icon = Icons.Default.Router,
+                                    label = "النقل الافتراضي المشفر",
+                                    value = if (isLanDebugHttpEnabled) "DTLS + LAN Debug" else "WebRTC DTLS Only",
                                     modifier = Modifier.weight(1f)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Key,
-                                        contentDescription = "رمز الجلسة",
-                                        tint = MaterialTheme.colorScheme.primary,
-                                        modifier = Modifier.size(16.dp)
+                                )
+                                TelemetryStatChip(
+                                    icon = Icons.Default.BatteryChargingFull,
+                                    label = "البطارية",
+                                    value = "${nodeInfo?.batteryLevel ?: 100}%",
+                                    modifier = Modifier.weight(0.7f)
+                                )
+                            }
+
+                            if (nodeInfo != null) {
+                                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text(
+                                            text = "المساحة المتاحة: ${RemoteFileItem.formatBytes(nodeInfo.freeStorageBytes)}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                        Text(
+                                            text = "الإجمالي: ${RemoteFileItem.formatBytes(nodeInfo.totalStorageBytes)}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                    LinearProgressIndicator(
+                                        progress = { nodeInfo.usedStorageFraction() },
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(8.dp)
+                                            .clip(RoundedCornerShape(50))
                                     )
-                                    Spacer(modifier = Modifier.width(6.dp))
+                                }
+
+                                val effectiveDisplayToken = authToken.ifBlank { nodeInfo.secretToken }
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                                        .padding(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Icon(
+                                                imageVector = Icons.Default.Key,
+                                                contentDescription = "رمز الجلسة المشفر",
+                                                tint = MaterialTheme.colorScheme.primary,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text(
+                                                text = "رمز الأمان 32-Byte (Keystore AES-GCM • غير مخزن في Firestore):",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                    }
                                     Text(
-                                        text = "رمز الأمان (x-auth-token): ${authToken.ifBlank { nodeInfo.secretToken }}",
+                                        text = effectiveDisplayToken.ifBlank { "جاري التوليد..." },
                                         style = MaterialTheme.typography.labelSmall,
                                         fontFamily = FontFamily.Monospace,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        color = MaterialTheme.colorScheme.primary,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
                                     )
+                                    Row(
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        OutlinedButton(
+                                            onClick = {
+                                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                                if (clipboard != null && effectiveDisplayToken.isNotBlank()) {
+                                                    clipboard.setPrimaryClip(
+                                                        ClipData.newPlainText("x-auth-token", effectiveDisplayToken)
+                                                    )
+                                                }
+                                            },
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .testTag("copy_server_token_button")
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Key,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text("نسخ التوكن")
+                                        }
+                                        OutlinedButton(
+                                            onClick = onRotateAuthToken,
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .testTag("rotate_server_token_button")
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Refresh,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text("تدوير 32B")
+                                        }
+                                        TextButton(onClick = onOpenAuthTokenDialog) {
+                                            Text("تعديل")
+                                        }
+                                    }
                                 }
-                                TextButton(onClick = onOpenAuthTokenDialog) {
-                                    Text("تعديل التوكن")
+
+                                // Screen Mirroring & WebRTC MediaProjection Quick Control
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "بث الشاشة المزدوج (/screenshot + WebRTC):",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        Text(
+                                            text = if (isMediaProjectionEnabled) {
+                                                "صلاحية MediaProjection مفعّلة • $webRtcStateText"
+                                            } else {
+                                                "PixelCopy نشط تلقائياً • $webRtcStateText"
+                                            },
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                    FilledTonalButton(
+                                        onClick = onRequestMediaProjection,
+                                        modifier = Modifier.testTag("enable_media_projection_button")
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.ScreenShare,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(if (isMediaProjectionEnabled) "مفعّل (30FPS)" else "بث الشاشة الكاملة")
+                                    }
                                 }
                             }
 
-                            // Screen Mirroring & WebRTC MediaProjection Quick Control
+                            statusMessage?.let { msg ->
+                                Text(
+                                    text = msg,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // SAF Shared Roots Management Card (Phase 1.1)
+                item {
+                    ElevatedCard(
+                        shape = RoundedCornerShape(20.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        imageVector = Icons.Default.Folder,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.primary
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Column {
+                                        Text(
+                                            text = "المجلدات المشتركة (SAF Shared Roots)",
+                                            style = MaterialTheme.typography.titleSmall,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        Text(
+                                            text = "يُسمح بالوصول فقط داخل هذه المجلدات عبر معرفات غير شفافة (rootId/relativePath)",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                                FilledTonalButton(
+                                    onClick = onAddSharedRoot,
+                                    modifier = Modifier.testTag("add_saf_shared_root_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Folder,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("إضافة مجلد")
+                                }
+                            }
+
+                            if (sharedRoots.isEmpty()) {
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.65f),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text(
+                                        text = "لم يتم اختيار أي مجلد مشترك بعد. اضغط «إضافة مجلد» لاختيار مجلد عبر SAF؛ سيرفض StorageGateway أي وصول خارج المجلدات المختارة برمز 403 Forbidden.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer,
+                                        modifier = Modifier.padding(12.dp)
+                                    )
+                                }
+                            } else {
+                                sharedRoots.forEach { entry ->
+                                    Surface(
+                                        shape = RoundedCornerShape(12.dp),
+                                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.SpaceBetween
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = entry.displayName,
+                                                    style = MaterialTheme.typography.bodyMedium,
+                                                    fontWeight = FontWeight.Bold
+                                                )
+                                                Text(
+                                                    text = "Opaque ID: ${entry.rootId} • ${if (entry.allowUploads) "مسموح بالرفع" else "قراءة فقط"}",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    fontFamily = FontFamily.Monospace,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                Switch(
+                                                    checked = entry.allowUploads,
+                                                    onCheckedChange = { allow ->
+                                                        onToggleRootAllowUploads(entry.rootId, allow)
+                                                    },
+                                                    modifier = Modifier.testTag("toggle_upload_${entry.rootId}")
+                                                )
+                                                IconButton(
+                                                    onClick = { onRemoveSharedRoot(entry.rootId) },
+                                                    modifier = Modifier.testTag("remove_root_${entry.rootId}")
+                                                ) {
+                                                    Icon(
+                                                        imageVector = Icons.Default.Delete,
+                                                        contentDescription = "إزالة المجلد المشترك",
+                                                        tint = MaterialTheme.colorScheme.error
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // LAN HTTP Debug Mode Card (Phase 1.5 - Disabled by default, shows explicit warning)
+                item {
+                    OutlinedCard(
+                        shape = RoundedCornerShape(18.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -1326,119 +1573,135 @@ fun HomeNodeServerScreen(
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(
-                                        text = "بث الشاشة المزدوج (/screenshot + WebRTC):",
-                                        style = MaterialTheme.typography.labelMedium,
+                                        text = "وضع تصحيح الشبكة المحلية (LAN HTTP Debug Mode)",
+                                        style = MaterialTheme.typography.bodyMedium,
                                         fontWeight = FontWeight.Bold
                                     )
                                     Text(
-                                        text = if (isMediaProjectionEnabled) {
-                                            "صلاحية MediaProjection مفعّلة • $webRtcStateText"
+                                        text = if (isLanDebugHttpEnabled) {
+                                            "مفعّل حالياً على المنفذ ${nodeInfo?.port ?: 8080} (معطّل افتراضياً)"
                                         } else {
-                                            "PixelCopy نشط تلقائياً • $webRtcStateText"
+                                            "معطّل افتراضياً • يتم النقل حصرياً عبر WebRTC DataChannel المشفر (DTLS)"
                                         },
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
-                                FilledTonalButton(
-                                    onClick = onRequestMediaProjection,
-                                    modifier = Modifier.testTag("enable_media_projection_button")
+                                Switch(
+                                    checked = isLanDebugHttpEnabled,
+                                    onCheckedChange = onToggleLanDebugHttp,
+                                    modifier = Modifier.testTag("lan_debug_http_switch")
+                                )
+                            }
+
+                            AnimatedVisibility(visible = isLanDebugHttpEnabled) {
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = MaterialTheme.colorScheme.errorContainer,
+                                    modifier = Modifier.fillMaxWidth()
                                 ) {
-                                    Icon(
-                                        imageVector = Icons.Default.ScreenShare,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text(if (isMediaProjectionEnabled) "مفعّل (30FPS)" else "بث الشاشة الكاملة")
+                                    Row(
+                                        modifier = Modifier.padding(10.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.WarningAmber,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.onErrorContainer
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(
+                                            text = "تحذير أمني (LAN Cleartext Debug): خادم HTTP المحلي غير مشفر بـ TLS على الشبكة المحلية (LAN). استخدمه فقط للتصحيح المحلي؛ الوضع الموصى به والافتراضي هو WebRTC DataChannel (DTLS).",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onErrorContainer
+                                        )
+                                    }
                                 }
                             }
-                        }
-
-                        statusMessage?.let { msg ->
-                            Text(
-                                text = msg,
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.primary
-                            )
                         }
                     }
                 }
 
                 // Real-Time WebRTC State Notification Banner (connecting, open, failed)
-                val serverRealtimeState = when {
-                    webRtcStateText.contains("open", ignoreCase = true) ||
-                        webRtcStateText.contains("CONNECTED", ignoreCase = true) ||
-                        webRtcStateText.contains("نشط", ignoreCase = true) -> "open"
-                    webRtcStateText.contains("failed", ignoreCase = true) ||
-                        webRtcStateText.contains("تعذر", ignoreCase = true) -> "failed"
-                    else -> "connecting"
-                }
-                WebRtcRealtimeStatusBanner(
-                    realtimeState = serverRealtimeState,
-                    detailMessage = webRtcStateText.ifBlank {
-                        "الحالة اللحظية: connecting • بانتظار اتصال الآدمن عبر STUN/TURN..."
+                item {
+                    val serverRealtimeState = when {
+                        webRtcStateText.contains("open", ignoreCase = true) ||
+                            webRtcStateText.contains("CONNECTED", ignoreCase = true) ||
+                            webRtcStateText.contains("نشط", ignoreCase = true) -> "open"
+                        webRtcStateText.contains("failed", ignoreCase = true) ||
+                            webRtcStateText.contains("تعذر", ignoreCase = true) -> "failed"
+                        else -> "connecting"
                     }
-                )
-
-                // Live Console Logs Header
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            imageVector = Icons.Default.Terminal,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.primary
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "سجل أحداث الخادم الفوري (Live Console Logs)",
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                    Text(
-                        text = "${logs.size} حدث",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    WebRtcRealtimeStatusBanner(
+                        realtimeState = serverRealtimeState,
+                        detailMessage = webRtcStateText.ifBlank {
+                            "الحالة اللحظية: connecting • بانتظار اتصال الآدمن عبر STUN/TURN..."
+                        }
                     )
                 }
 
-                // Live Console Logs Terminal Box
-                Surface(
-                    shape = RoundedCornerShape(18.dp),
-                    color = Color(0xFF070F1E),
-                    tonalElevation = 4.dp,
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
-                ) {
-                    if (logs.isEmpty()) {
-                        Box(
-                            modifier = Modifier.fillMaxSize(),
-                            contentAlignment = Alignment.Center
-                        ) {
+                // Live Console Logs Header
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.Terminal,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "يعمل الخادم المنزلي تلقائياً ودائماً في الخلفية وبانتظار الطلبات الواردة عبر نفق WebRTC P2P...",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Color(0xFF64748B),
-                                textAlign = TextAlign.Center,
-                                modifier = Modifier.padding(24.dp)
+                                text = "سجل أحداث الخادم الفوري (Sanitized Live Console Logs)",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold
                             )
                         }
-                    } else {
-                        LazyColumn(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .testTag("server_logs_list"),
-                            contentPadding = PaddingValues(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            items(logs, key = { it.id }) { log ->
-                                ConsoleLogItemRow(log = log)
+                        Text(
+                            text = "${logs.size} حدث",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                // Live Console Logs Terminal Box
+                item {
+                    Surface(
+                        shape = RoundedCornerShape(18.dp),
+                        color = Color(0xFF070F1E),
+                        tonalElevation = 4.dp,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(260.dp)
+                    ) {
+                        if (logs.isEmpty()) {
+                            Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = "يعمل الخادم المنزلي تلقائياً ودائماً في الخلفية وبانتظار الطلبات الواردة عبر نفق WebRTC P2P...",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color(0xFF64748B),
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.padding(24.dp)
+                                )
+                            }
+                        } else {
+                            LazyColumn(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .testTag("server_logs_list"),
+                                contentPadding = PaddingValues(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                items(logs, key = { it.id }) { log ->
+                                    ConsoleLogItemRow(log = log)
+                                }
                             }
                         }
                     }
@@ -2492,13 +2755,8 @@ private fun BreadcrumbBar(
     rootPath: String,
     onNavigateToPath: (String) -> Unit
 ) {
-    val effectiveRoot = rootPath.ifBlank { "/" }
-    val relative = if (currentPath.startsWith(effectiveRoot)) {
-        currentPath.removePrefix(effectiveRoot).trim('/')
-    } else {
-        currentPath.trim('/')
-    }
-    val segments = if (relative.isEmpty()) emptyList() else relative.split("/")
+    val trimmedCurrent = currentPath.trim('/')
+    val segments = if (trimmedCurrent.isEmpty()) emptyList() else trimmedCurrent.split("/")
 
     Surface(
         shape = RoundedCornerShape(14.dp),
@@ -2517,18 +2775,18 @@ private fun BreadcrumbBar(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
                         .clip(RoundedCornerShape(8.dp))
-                        .clickable { onNavigateToPath(effectiveRoot) }
+                        .clickable { onNavigateToPath("") }
                         .padding(horizontal = 8.dp, vertical = 4.dp)
                 ) {
                     Icon(
                         imageVector = Icons.Default.Home,
-                        contentDescription = "المجلد الرئيسي",
+                        contentDescription = "المجلدات المشتركة (Shared Roots)",
                         tint = MaterialTheme.colorScheme.primary,
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(modifier = Modifier.width(4.dp))
                     Text(
-                        text = "الرئيسية",
+                        text = "المجلدات المشتركة",
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.primary
@@ -2537,13 +2795,7 @@ private fun BreadcrumbBar(
             }
 
             itemsIndexed(segments) { index, segment ->
-                val targetPath = buildString {
-                    append(effectiveRoot.trimEnd('/'))
-                    for (i in 0..index) {
-                        append("/")
-                        append(segments[i])
-                    }
-                }
+                val targetPath = segments.subList(0, index + 1).joinToString("/")
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
                         imageVector = Icons.Default.ChevronLeft,
@@ -2555,6 +2807,7 @@ private fun BreadcrumbBar(
                         text = segment,
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = if (index == segments.lastIndex) FontWeight.Bold else FontWeight.Normal,
+                        fontFamily = if (index == 0) FontFamily.Monospace else FontFamily.Default,
                         color = if (index == segments.lastIndex) {
                             MaterialTheme.colorScheme.onSurface
                         } else {
